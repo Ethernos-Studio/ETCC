@@ -1,0 +1,260 @@
+# Ethernos Tiny C Compiler (ETCC)
+
+一个面向 **Windows x64** 的 C 子集编译器。前端、类型系统、语义分析、后端无关的 typed IR 和独立 C 运行时全部由本项目实现；当前代码生成通过 **LLVM 文本 IR + Clang + LLD** 完成。
+
+> 第一个里程碑（已完成）：**用 ETCC 编译 Hello World，链接 ETCC 自己的 C 运行时，生成不依赖 MSVC CRT / UCRT 的 Windows EXE 并成功运行。**
+
+```text
+$ build\etcc.exe tests\hello.c -o build\hello.exe
+$ build\hello.exe
+Hello, World!
+```
+
+## 为什么不是“再写一个 TCC”
+
+ETCC 从第一天就按可替换后端设计：
+
+```
+C source
+   │
+   ▼
+preprocessor ──► lexer ──► parser ──► semantic analysis
+                                             │
+                                             ▼
+                                  backend-independent typed IR
+                                             │
+                         ┌───────────────────┴───────────────────┐
+                         ▼                                       ▼
+                    LLVM backend                          future backends
+              (textual IR → COFF)                    (x86-64 / C / WASM / ...)
+                         │
+                         ▼
+                 ETCC runtime (own libc, no CRT)
+                         │
+                         ▼
+                    lld-link → .exe
+```
+
+前端不会 import 任何 LLVM 头文件，IR 中也不出现 `llvm::Value`。换后端只需要实现 `EtccBackendOps`，前端和运行时链接契约保持不变。
+
+## 快速开始
+
+### 依赖
+
+| 组件 | 用途 | 本机验证版本 |
+|---|---|---|
+| Windows 10/11 x64 | 目标平台 | Windows |
+| MinGW-w64 GCC | 编译编译器本身 | 16.2.0 |
+| LLVM / Clang / LLD | LLVM 后端、COFF 汇编与链接 | 22.1.8 |
+| Windows SDK | `kernel32.lib` | 10.0.26100.0 |
+| GNU Make (`mingw32-make`) | 构建 | — |
+| Python 3 | 端到端测试 | 3.15 |
+
+### 构建
+
+```bat
+mingw32-make
+mingw32-make test
+```
+
+构建产物：
+
+```text
+build\etcc.exe              编译器驱动
+build\runtime\etccrt.lib    自己的 C 运行时（crt0 + libc 子集）
+```
+
+### 编译并运行
+
+```bat
+build\etcc.exe tests\hello.c -o build\hello.exe
+build\hello.exe
+```
+
+编译器会自动发现：
+
+- `clang` / `lld-link`（PATH，或环境变量）
+- Windows SDK 下的 `kernel32.lib`
+- `build\runtime\etccrt.lib`
+- `runtime\include`（自己的 C 库头文件）
+
+可用环境变量覆盖：
+
+```text
+ETCC_CLANG
+ETCC_LLD_LINK
+ETCC_KERNEL32_LIB
+ETCC_RUNTIME_LIB
+ETCC_RUNTIME_INCLUDE
+```
+
+也可用命令行覆盖：`--clang`、`--lld-link`、`--kernel32`、`--runtime-lib`、`--runtime-include`。
+
+## 已实现的语言子集
+
+### 类型
+
+- `void`、`_Bool`
+- `char` / `signed char` / `unsigned char`
+- `short` / `unsigned short`
+- `int` / `unsigned int`
+- `long` / `unsigned long`（Windows LLP64：32 位）
+- `long long` / `unsigned long long`
+- 多级指针、多维数组、函数类型
+- `const` / `volatile` / `restrict` 限定符（`const` 参与类型表示）
+- `typedef`
+
+### 声明与语句
+
+- 全局变量、局部变量、函数定义、函数原型
+- `static`、`extern`（局部 `static` 目前会明确报错）
+- 复合语句、`if` / `else`、`while`、`do` / `while`、`for`
+- `break`、`continue`、`return`
+- C99 风格的块内声明、`for (int i = 0; ...)`
+
+### 表达式
+
+- 完整优先级的算术、位运算、比较、逻辑运算
+- `&&` / `||` 短路求值（通过 CFG + 临时槽实现）
+- 赋值与复合赋值：`= += -= *= /= %= &= |= ^= <<= >>=`
+- 前置/后置 `++` / `--`
+- 三元表达式、逗号表达式
+- 函数调用、数组下标、`&` / `*`
+- 显式类型转换、`sizeof(type)` / `sizeof expr`
+- 整数提升、常用算术转换、指针算术、指针相减
+
+### 预处理器
+
+- `#include "..."` / `#include <...>`
+- `-I` 搜索路径、`-D` / `-U`
+- 对象式宏、宏递归展开保护
+- `#if` / `#ifdef` / `#ifndef` / `#elif` / `#else` / `#endif`
+- `#if` 中的 `defined`、整数运算、比较、逻辑运算
+- `#error` / `#warning`
+- include guard、`#pragma once`
+- 预定义宏：`__ETCC__`、`__STDC__`、`__STDC_VERSION__`、`_WIN32`、`_WIN64`、`_M_X64`、`__x86_64__`
+
+### 运行时（自己的 C 库）
+
+`runtime/` 不链接 MSVC CRT / UCRT，只导入 `kernel32.dll`：
+
+- 自定义入口 `etcc_entry`：构造 `argc/argv`，调用 `main(argc, argv)`，`ExitProcess`
+- `puts`、`printf`、`putchar`、`fputs`、`fflush`
+- `malloc`、`calloc`、`realloc`、`free`
+- `exit`、`abort`
+- `memcpy`、`memmove`、`memset`、`memcmp`
+- `strlen`、`strcmp`、`strncmp`、`strcpy`、`strncpy`、`strcat`
+- 头文件：`stdio.h`、`stdlib.h`、`string.h`、`stddef.h`、`stdint.h`、`stdbool.h`、`limits.h`
+
+`printf` 支持 `%d %i %u %o %x %X %c %s %p %%`，以及 `hh/h/l/ll/z/j/t` 长度修饰、宽度、精度和常用 flag。
+
+## 驱动用法
+
+```bat
+etcc [options] <input.c>
+
+  -o <file>              输出文件
+  -c                     只生成 COFF 目标文件
+  -S, --emit-llvm        输出后端文本 IR
+  -E, --emit-pp          输出预处理结果
+  -I <dir>               添加 include 搜索路径
+  -D <name>[=<value>]    定义对象宏
+  -U <name>              取消宏
+  --backend <name>       选择后端（当前为 llvm）
+  --clang <path>         LLVM 后端使用的 clang
+  --lld-link <path>      lld-link
+  --kernel32 <path>      kernel32.lib
+  --runtime-lib <path>   ETCC 运行时库
+  --runtime-include <dir> ETCC 运行时头文件
+  -v, --verbose          打印工具链路径和实际命令
+  --save-temps           保留链接阶段的临时目标文件
+  --version
+```
+
+## 测试
+
+```bat
+mingw32-make test
+```
+
+测试覆盖：
+
+- Hello World（里程碑）
+- EXE 只导入 `KERNEL32.dll`，没有 VCRUNTIME / UCRT / MSVCRT
+- `argc/argv`
+- 表达式、控制流、递归、作用域、位运算、64 位整数
+- 数组、二级指针、指针算术、显式类型转换
+- 字符串/字符转义、相邻字符串拼接
+- `printf` 宽度、精度、符号、十六进制/八进制/指针/64 位格式
+- include path、include guard、`#pragma once`、命令行宏、条件编译
+- 预定义宏
+- `-S` LLVM IR、`-c` COFF 目标文件
+- 错误诊断（文件/行/列 + 源码 caret）
+- 预处理输出
+- 后端注册表与未知后端错误
+
+最近一次结果：**49 passed, 0 failed**。
+
+## 目录结构
+
+```text
+include/etcc/          编译器内部头文件
+  common.h             arena / 动态字符串 / vector 工具
+  source.h             源文件与 source map
+  diag.h               诊断
+  token.h / lexer.h    词法
+  pp.h                 预处理器
+  ast.h / parser.h     AST 与语法分析
+  ctype.h              C 类型系统
+  ir.h                 后端无关 typed IR
+  sema.h               语义分析 + IR 降级
+  backend.h            后端接口 / 注册表
+  platform.h           宿主平台（路径、进程）
+src/                   对应实现 + driver.c
+runtime/include/       自己的 C 库头文件
+runtime/src/           自己的 crt0 + libc 实现
+tests/                 端到端测试与测试驱动
+docs/                  架构与后端开发文档
+```
+
+## 设计要点
+
+1. **typed IR 是前后端唯一契约**。IR 类型、值、指令、基本块、terminator、全局对象全部独立定义。
+2. **后端通过 ops 表 + 注册表接入**。`EtccBackendOps` 只要求 `emit_object` / `emit_ir`，驱动层不关心实现。
+3. **运行时与编译器解耦**。编译器只生成对 `main`、libc 符号的普通 COFF 引用；运行时是独立静态库。
+4. **没有 CRT 也能启动**。`etcc_entry` 直接使用 `GetCommandLineA`、`HeapAlloc`、`WriteFile`、`ExitProcess`。
+5. **错误不 `exit(1)` 散落在词法层**。诊断统一带 `SourceFile/line/column`，可打印源码行与 caret；解析器有错误恢复。
+6. **Windows 路径与引号是显式处理的**。编译器用 `CreateProcessA` 并实现 MSVC 参数引用规则，能处理 `Program Files` 这类路径。
+7. **工具链自动发现 + 全部可覆盖**。适合本机开发，也为未来打包安装布局留出路径。
+
+更多细节见：
+
+- [架构说明](docs/ARCHITECTURE.md)
+- [后端开发指南](docs/BACKENDS.md)
+- [里程碑记录](docs/MILESTONE.md)
+
+## 当前限制（有意留在后续里程碑）
+
+- 目标固定为 **Windows x64 / Microsoft ABI**；宿主也按 Windows 构建。
+- 不支持 `struct` / `union` / `enum`、浮点类型、`switch` / `goto`、函数指针、变参函数**定义**、VLA、位域、`_Atomic`。
+- 不支持花括号初始化器；全局数组初始化也暂未实现。
+- 预处理器暂不支持函数式宏、`#` / `##`、`_Pragma`；`-E` 输出是 include/条件编译后的源码，对象宏仍在词法阶段展开，因此 `-E` 文本中不会展开对象宏。
+- 一次只接受一个输入文件。
+- 没有优化管线，后端以 `-O0` 汇编 IR。
+- 编译器尚未自举；`runtime` 当前由 Clang 构建。未来可以让 ETCC 编译自己的运行时，再逐步自举。
+- `printf` 不支持浮点格式；运行时暂不提供文件 I/O、`FILE`、`scanf`。
+
+## 路线图
+
+1. **类型系统扩展**：`struct` / `union` / `enum`、成员访问、结构体按值传参/返回、`typedef` 作用域完善。
+2. **初始化器**：数组/结构体花括号初始化、字符串数组长度推导、全局聚合初始化。
+3. **预处理器完整化**：函数式宏、`#`/`##`、宏展开后的 `-E`、`#line`。
+4. **语言完整性**：`switch`、`goto`、函数指针、变参函数定义、浮点。
+5. **运行时扩展**：文件 I/O、`FILE`、更完整的格式化、环境变量、堆调试。
+6. **优化与诊断**：常量折叠、死代码消除、类型检查强化、警告分级。
+7. **新后端**：x86-64 原生后端（直接生成 COFF/PE）、C 后端、WASM 后端；用同一套测试矩阵验证。
+8. **自举**：用 ETCC 构建 runtime，再构建编译器自身。
+
+## 许可
+
+未指定许可证；在加入正式许可证前，默认保留所有权利。
