@@ -1,4 +1,4 @@
-#include "etcc/backend.h"
+﻿#include "etcc/backend.h"
 
 #include "etcc/platform.h"
 
@@ -11,6 +11,7 @@ typedef struct {
     EtccArena *arena;
     EtccDiagnostics *diag;
     const char *clang;
+    const char *llc;
     bool verbose;
 } LlvmBackend;
 
@@ -398,6 +399,67 @@ static bool llvm_emit_ir(EtccBackend *b, const IrModule *m, const char *path,
     return write_ir_file(&e, path, diag);
 }
 
+static bool llvm_assemble_object(LlvmBackend *lb, const char *ir_path,
+                                     const char *obj_path) {
+    const char *clang = lb->clang && *lb->clang ? lb->clang : "clang";
+
+    if (lb->llc && *lb->llc) {
+        char *llc[10];
+        int n = 0;
+        llc[n++] = (char *)lb->llc;
+        llc[n++] = "-mtriple=x86_64-pc-windows-msvc";
+        llc[n++] = "-filetype=obj";
+        llc[n++] = "-O0";
+        llc[n++] = "-o";
+        llc[n++] = (char *)obj_path;
+        llc[n++] = (char *)ir_path;
+        llc[n] = NULL;
+        if (etcc_run_process(llc, lb->verbose)) return true;
+    }
+
+    /*
+     * Calling clang's cc1 frontend directly avoids the clang driver's extra
+     * process startup and argument translation.  IR -> COFF does not need
+     * driver features.  This is an internal interface, so fall back to the
+     * public driver command if a future LLVM changes the cc1 options.
+     */
+    char *cc1[20];
+    int n = 0;
+    cc1[n++] = (char *)clang;
+    cc1[n++] = "-cc1";
+    cc1[n++] = "-triple";
+    cc1[n++] = "x86_64-pc-windows-msvc";
+    cc1[n++] = "-emit-obj";
+    cc1[n++] = "-O0";
+    cc1[n++] = "-ffreestanding";
+    cc1[n++] = "-stack-protector";
+    cc1[n++] = "0";
+    cc1[n++] = "-o";
+    cc1[n++] = (char *)obj_path;
+    cc1[n++] = (char *)ir_path;
+    cc1[n] = NULL;
+
+    if (etcc_run_process(cc1, lb->verbose)) return true;
+
+    char *driver[20];
+    n = 0;
+    driver[n++] = (char *)clang;
+    driver[n++] = "--target=x86_64-pc-windows-msvc";
+    driver[n++] = "-c";
+    driver[n++] = "-O0";
+    driver[n++] = "-ffreestanding";
+    driver[n++] = "-fno-stack-protector";
+    driver[n++] = "-fno-asynchronous-unwind-tables";
+    driver[n++] = "-Wno-override-module";
+    driver[n++] = "-x";
+    driver[n++] = "ir";
+    driver[n++] = (char *)ir_path;
+    driver[n++] = "-o";
+    driver[n++] = (char *)obj_path;
+    driver[n] = NULL;
+    return etcc_run_process(driver, lb->verbose);
+}
+
 static bool llvm_emit_object(EtccBackend *b, const IrModule *m,
                              const char *obj_path, EtccDiagnostics *diag) {
     LlvmBackend *lb = b->impl;
@@ -409,24 +471,7 @@ static bool llvm_emit_object(EtccBackend *b, const IrModule *m,
         return false;
     }
 
-    char *argv[16];
-    int n = 0;
-    argv[n++] = (char *)(lb->clang && *lb->clang ? lb->clang : "clang");
-    argv[n++] = "--target=x86_64-pc-windows-msvc";
-    argv[n++] = "-c";
-    argv[n++] = "-O0";
-    argv[n++] = "-ffreestanding";
-    argv[n++] = "-fno-stack-protector";
-    argv[n++] = "-fno-asynchronous-unwind-tables";
-    argv[n++] = "-Wno-override-module";
-    argv[n++] = "-x";
-    argv[n++] = "ir";
-    argv[n++] = ir_path;
-    argv[n++] = "-o";
-    argv[n++] = (char *)obj_path;
-    argv[n] = NULL;
-
-    bool ok = etcc_run_process(argv, lb->verbose);
+    bool ok = llvm_assemble_object(lb, ir_path, obj_path);
     etcc_remove_file_if_exists(ir_path);
     if (!ok) {
         etcc_diag_error_global(diag,
@@ -465,6 +510,9 @@ EtccBackend *etcc_backend_llvm_create(EtccArena *arena, EtccDiagnostics *diag,
                                   options && options->clang_path
                                       ? options->clang_path
                                       : "clang");
+    lb->llc = options && options->llc_path
+                  ? etcc_arena_strdup(arena, options->llc_path)
+                  : NULL;
     lb->verbose = options && options->verbose;
 
     EtccBackend *b = etcc_arena_alloc(arena, sizeof(*b), _Alignof(EtccBackend));

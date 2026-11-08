@@ -20,11 +20,18 @@ typedef struct {
 } TagEntry;
 
 typedef struct {
+    const char *name;
+    int64_t value;
+    int depth;
+} ParserEnumConst;
+
+typedef struct {
     EtccCType *type;
     EtccStorageClass storage;
     bool saw_type;
     bool saw_storage;
     bool saw_const;
+    EtccAstNode *enum_consts;
 } DeclSpec;
 
 typedef struct {
@@ -44,6 +51,7 @@ typedef struct EtccParser {
     bool has_peeked;
     ETCC_VEC(TypedefEntry) typedefs;
     ETCC_VEC(TagEntry) tags;
+    ETCC_VEC(ParserEnumConst) enum_values;
     int tag_depth;
     bool fatal;
 } EtccParser;
@@ -59,6 +67,9 @@ static Declarator parse_declarator(EtccParser *p, EtccCType *base,
                                    bool abstract);
 static bool parse_decl_specifiers(EtccParser *p, DeclSpec *ds);
 static EtccCType *parse_struct_union_specifier(EtccParser *p, bool is_union);
+static EtccCType *parse_enum_specifier(EtccParser *p, DeclSpec *ds);
+static void append_chain(EtccAstNode **head, EtccAstNode **tail,
+                         EtccAstNode *chain);
 
 static void parser_error(EtccParser *p, EtccLoc loc, const char *fmt, ...) {
     if (p->fatal) return;
@@ -227,6 +238,19 @@ static bool eval_const_int(EtccParser *p, EtccAstNode *n, int64_t *out) {
     case AST_CHAR_LIT:
         *out = n->u.char_lit.value;
         return true;
+    case AST_IDENT: {
+        for (size_t i = p->enum_values.len; i > 0; i--) {
+            const ParserEnumConst *e = &p->enum_values.items[i - 1];
+            if (e->depth > p->tag_depth) continue;
+            size_t elen = strlen(e->name);
+            if (elen == n->u.ident.len &&
+                memcmp(e->name, n->u.ident.name, elen) == 0) {
+                *out = e->value;
+                return true;
+            }
+        }
+        return false;
+    }
     case AST_UNARY: {
         int64_t v;
         if (!eval_const_int(p, n->u.unary.operand, &v)) return false;
@@ -457,6 +481,73 @@ static EtccCType *parse_struct_union_specifier(EtccParser *p, bool is_union) {
     return type;
 }
 
+static void enum_const_append(DeclSpec *ds, EtccAstNode *node) {
+    if (!ds->enum_consts) {
+        ds->enum_consts = node;
+        return;
+    }
+    EtccAstNode *tail = ds->enum_consts;
+    while (tail->next) tail = tail->next;
+    tail->next = node;
+}
+
+static EtccCType *parse_enum_specifier(EtccParser *p, DeclSpec *ds) {
+    EtccLoc loc = p->cur.loc;
+    parser_advance(p); /* enum */
+
+    if (check(p, TK_IDENT)) parser_advance(p); /* tag; enum types are int */
+
+    if (!check(p, TK_LBRACE)) {
+        /* `enum Tag` is represented as int; the tag itself is not used for
+         * layout or code generation in this milestone. */
+        return etcc_type_builtin(CT_INT);
+    }
+
+    parser_advance(p);
+    int64_t next_value = 0;
+    size_t count = 0;
+
+    while (!check(p, TK_RBRACE) && !check(p, TK_EOF) && !p->fatal) {
+        if (!check(p, TK_IDENT)) {
+            parser_error(p, p->cur.loc, "expected an enumerator name");
+            break;
+        }
+        EtccToken name_tok = p->cur;
+        char *name = ident_text(p, name_tok);
+        parser_advance(p);
+
+        int64_t value = next_value;
+        if (accept(p, TK_ASSIGN)) {
+            if (!parse_const_int(p, &value)) {
+                value = 0;
+                recover_statement(p);
+            }
+        }
+
+        EtccAstNode *node = etcc_ast_new(p->arena, AST_ENUM_CONST, name_tok.loc);
+        node->u.enum_const.name = name;
+        node->u.enum_const.len = name_tok.v.ident.len;
+        node->u.enum_const.value = value;
+        enum_const_append(ds, node);
+
+        ParserEnumConst ec = {name, value, p->tag_depth};
+        if (!ETCC_VEC_PUSH(p->enum_values, ec))
+            parser_error(p, name_tok.loc, "out of memory");
+
+        next_value = value + 1;
+        count++;
+
+        if (accept(p, TK_COMMA)) {
+            if (check(p, TK_RBRACE)) break;
+            continue;
+        }
+        break;
+    }
+    expect(p, TK_RBRACE, "'}'");
+    if (count == 0) parser_error(p, loc, "empty enum is not supported");
+    return etcc_type_builtin(CT_INT);
+}
+
 static bool parse_decl_specifiers(EtccParser *p, DeclSpec *ds) {
     memset(ds, 0, sizeof(*ds));
     bool saw_signed = false, saw_unsigned = false;
@@ -584,12 +675,13 @@ static bool parse_decl_specifiers(EtccParser *p, DeclSpec *ds) {
             continue;
         }
         if (k == TK_KW_ENUM) {
-            parser_error(p, p->cur.loc,
-                         "enum types are not supported yet");
-            parser_advance(p);
-            if (check(p, TK_IDENT)) parser_advance(p);
-            if (check(p, TK_LBRACE)) skip_balanced(p, TK_LBRACE, TK_RBRACE);
-            explicit_type = etcc_type_builtin(CT_INT);
+            if (explicit_type || saw_signed || saw_unsigned || saw_char ||
+                saw_short || saw_int || long_count || saw_void ||
+                saw_bool || saw_float || saw_double) {
+                parser_error(p, p->cur.loc,
+                             "cannot combine an enum with other type specifiers");
+            }
+            explicit_type = parse_enum_specifier(p, ds);
             ds->saw_type = true;
             any = true;
             continue;
@@ -1313,6 +1405,7 @@ static EtccAstNode *parse_statement(EtccParser *p) {
                 DeclSpec ds;
                 parse_decl_specifiers(p, &ds);
                 EtccAstNode *head = NULL, *tail = NULL;
+                append_chain(&head, &tail, ds.enum_consts);
                 for (;;) {
                     Declarator d = parse_declarator(p, ds.type, false);
                     if (d.name) {
@@ -1356,6 +1449,49 @@ static EtccAstNode *parse_statement(EtccParser *p) {
         n->u.for_.body = body;
         return n;
     }
+    if (check(p, TK_KW_SWITCH)) {
+        parser_advance(p);
+        expect(p, TK_LPAREN, "'('");
+        EtccAstNode *cond = parse_expression(p);
+        expect(p, TK_RPAREN, "')'");
+        EtccAstNode *body = parse_statement(p);
+        EtccAstNode *n = etcc_ast_new(p->arena, AST_SWITCH, t.loc);
+        n->u.switch_.cond = cond;
+        n->u.switch_.body = body;
+        return n;
+    }
+    if (check(p, TK_KW_CASE)) {
+        parser_advance(p);
+        EtccAstNode *value = parse_assignment(p);
+        expect(p, TK_COLON, "':'");
+        EtccAstNode *body = parse_statement(p);
+        EtccAstNode *n = etcc_ast_new(p->arena, AST_CASE, t.loc);
+        n->u.case_.value = value;
+        n->u.case_.body = body;
+        return n;
+    }
+    if (check(p, TK_KW_DEFAULT)) {
+        parser_advance(p);
+        expect(p, TK_COLON, "':'");
+        EtccAstNode *body = parse_statement(p);
+        EtccAstNode *n = etcc_ast_new(p->arena, AST_DEFAULT, t.loc);
+        n->u.default_.body = body;
+        return n;
+    }
+    if (check(p, TK_KW_GOTO)) {
+        parser_advance(p);
+        if (!check(p, TK_IDENT)) {
+            parser_error(p, p->cur.loc, "expected a label name after 'goto'");
+            recover_statement(p);
+            return NULL;
+        }
+        EtccAstNode *n = etcc_ast_new(p->arena, AST_GOTO, t.loc);
+        n->u.goto_.name = p->cur.v.ident.data;
+        n->u.goto_.len = p->cur.v.ident.len;
+        parser_advance(p);
+        expect(p, TK_SEMICOLON, "';'");
+        return n;
+    }
     if (check(p, TK_KW_BREAK)) {
         parser_advance(p);
         expect(p, TK_SEMICOLON, "';'");
@@ -1366,13 +1502,16 @@ static EtccAstNode *parse_statement(EtccParser *p) {
         expect(p, TK_SEMICOLON, "';'");
         return etcc_ast_new(p->arena, AST_CONTINUE, t.loc);
     }
-    if (check(p, TK_KW_SWITCH) || check(p, TK_KW_CASE) ||
-        check(p, TK_KW_DEFAULT) || check(p, TK_KW_GOTO)) {
-        parser_error(p, t.loc, "'%s' is not supported yet",
-                     etcc_token_kind_name(t.kind));
+    if (check(p, TK_IDENT) && parser_peek(p).kind == TK_COLON) {
+        EtccToken name = p->cur;
         parser_advance(p);
-        recover_statement(p);
-        return NULL;
+        expect(p, TK_COLON, "':'");
+        EtccAstNode *body = parse_statement(p);
+        EtccAstNode *n = etcc_ast_new(p->arena, AST_LABEL, name.loc);
+        n->u.label.name = name.v.ident.data;
+        n->u.label.len = name.v.ident.len;
+        n->u.label.body = body;
+        return n;
     }
 
     EtccAstNode *e = parse_expression(p);
@@ -1394,6 +1533,16 @@ static void append_node(EtccAstNode **head, EtccAstNode **tail,
     *tail = n;
 }
 
+static void append_chain(EtccAstNode **head, EtccAstNode **tail,
+                         EtccAstNode *chain) {
+    while (chain) {
+        EtccAstNode *next = chain->next;
+        chain->next = NULL;
+        append_node(head, tail, chain);
+        chain = next;
+    }
+}
+
 static EtccAstNode *parse_compound(EtccParser *p) {
     EtccLoc loc = p->cur.loc;
     if (!expect(p, TK_LBRACE, "'{'")) return NULL;
@@ -1411,10 +1560,13 @@ static EtccAstNode *parse_compound(EtccParser *p) {
                 continue;
             }
             if (check(p, TK_SEMICOLON)) {
-                /* A tag declaration such as `struct S;` has no declarator. */
+                /* A tag/enum declaration such as `struct S;` or
+                 * `enum E { A, B };` has no declarator. */
+                append_chain(&head, &tail, ds.enum_consts);
                 parser_advance(p);
                 continue;
             }
+            append_chain(&head, &tail, ds.enum_consts);
             bool ok = true;
             for (;;) {
                 Declarator d = parse_declarator(p, ds.type, false);
@@ -1537,6 +1689,7 @@ EtccAstNode *etcc_parse_translation_unit(EtccArena *arena,
             recover_statement(&p);
             continue;
         }
+        append_chain(&head, &tail, ds.enum_consts);
         if (check(&p, TK_SEMICOLON)) {
             parser_advance(&p);
             continue;
@@ -1577,5 +1730,6 @@ EtccAstNode *etcc_parse_translation_unit(EtccArena *arena,
     tu->u.tu.decls = head;
     free(p.typedefs.items);
     free(p.tags.items);
+    free(p.enum_values.items);
     return tu;
 }

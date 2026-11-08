@@ -113,6 +113,39 @@ char *etcc_make_temp_path(EtccArena *a, const char *extension) {
     return etcc_path_join(a, dir, name);
 }
 
+char *etcc_find_program(EtccArena *a, const char *name) {
+#ifdef _WIN32
+    char buf[4096];
+    DWORD n = SearchPathA(NULL, name, ".exe", (DWORD)sizeof(buf), buf, NULL);
+    if (n > 0 && n < sizeof(buf)) return etcc_arena_strdup(a, buf);
+
+    char *path = getenv("PATH");
+    if (path) {
+        const char *p = path;
+        while (*p) {
+            const char *end = strchr(p, ';');
+            size_t len = end ? (size_t)(end - p) : strlen(p);
+            if (len && len < 4000) {
+                char candidate[4096];
+                memcpy(candidate, p, len);
+                candidate[len] = '\0';
+                char *joined = etcc_path_join(a, candidate, name);
+                if (etcc_file_exists(joined)) return joined;
+                char *with_ext = etcc_arena_printf(a, "%s.exe", joined);
+                if (etcc_file_exists(with_ext)) return with_ext;
+            }
+            if (!end) break;
+            p = end + 1;
+        }
+    }
+    return NULL;
+#else
+    (void)a;
+    (void)name;
+    return NULL;
+#endif
+}
+
 bool etcc_run_process(char *const argv[], bool verbose) {
     if (verbose) {
         fputs("etcc: run:", stderr);

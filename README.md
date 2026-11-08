@@ -46,7 +46,7 @@ preprocessor ──► lexer ──► parser ──► semantic analysis
 | Windows 10/11 x64 | 目标平台 | Windows |
 | CMake | 构建系统 | 4.4.4 |
 | MinGW-w64 GCC | 编译编译器本身 | 16.2.0 |
-| LLVM / Clang / LLD | LLVM 后端、COFF 汇编与链接 | 22.1.8 |
+| LLVM / Clang / llc / LLD | LLVM 后端、COFF 汇编与链接 | 22.1.8 |
 | Windows SDK | `kernel32.lib` | 10.0.26100.0 |
 | Python 3 | 端到端测试 | 3.15 |
 
@@ -96,13 +96,15 @@ build\hello.exe
 
 ```text
 ETCC_CLANG
+ETCC_LLC
+ETCC_LINK
 ETCC_LLD_LINK
 ETCC_KERNEL32_LIB
 ETCC_RUNTIME_LIB
 ETCC_RUNTIME_INCLUDE
 ```
 
-也可用命令行覆盖：`--clang`、`--lld-link`、`--kernel32`、`--runtime-lib`、`--runtime-include`。
+也可用命令行覆盖：`--clang`、`--llc`、`--linker`、`--lld-link`、`--kernel32`、`--runtime-lib`、`--runtime-include`。
 
 ## 已实现的语言子集
 
@@ -116,6 +118,7 @@ ETCC_RUNTIME_INCLUDE
 - `long long` / `unsigned long long`
 - 多级指针、多维数组、函数类型
 - `struct` / `union`：具名/匿名标签、前置声明、自引用指针、嵌套、数组、成员布局与对齐
+- `enum`：枚举定义、显式/隐式值、作用域内常量
 - `const` / `volatile` / `restrict` 限定符（`const` 参与类型表示）
 - `typedef`
 
@@ -124,6 +127,8 @@ ETCC_RUNTIME_INCLUDE
 - 全局变量、局部变量、函数定义、函数原型
 - `static`、`extern`（局部 `static` 目前会明确报错）
 - 复合语句、`if` / `else`、`while`、`do` / `while`、`for`
+- `switch` / `case` / `default`，支持 fallthrough 与 `break`
+- `goto` 与函数内标签（前向/后向、跨块跳转）
 - `break`、`continue`、`return`
 - C99 风格的块内声明、`for (int i = 0; ...)`
 
@@ -151,6 +156,14 @@ ETCC_RUNTIME_INCLUDE
 - 局部与全局的 `{ ... }` 聚合初始化，支持嵌套、部分初始化补零
 - `char s[] = "abc"`、`char buf[8] = "hi"`、`int a[] = {1, 2, 3}` 长度推导
 - 全局整数/字符数组、结构体、联合体初始化（编译期写为静态字节数据）
+
+### 控制流与枚举
+
+- `switch` 整数分派：case 链、`default`、fallthrough、`break`
+- 嵌套 `switch`、switch 内 `continue` 到外层循环
+- `goto` 标签：前向/后向、跳入/跳出循环与 switch、函数级标签作用域
+- 枚举常量：`enum { A, B = 5, C }`、表达式初值、作用域遮蔽
+- 枚举常量可用于 `case`、数组长度、全局初始化器
 
 ### 预处理器
 
@@ -190,8 +203,10 @@ etcc [options] <input.c>
   -D <name>[=<value>]    定义对象宏
   -U <name>              取消宏
   --backend <name>       选择后端（当前为 llvm）
-  --clang <path>         LLVM 后端使用的 clang
-  --lld-link <path>      lld-link
+  --clang <path>         LLVM 后端使用的 clang（cc1 回退路径）
+  --llc <path>           llc（优先的 IR -> COFF 路径）
+  --linker <path>        链接器（lld-link 或 MSVC link.exe）
+  --lld-link <path>      --linker 的别名
   --kernel32 <path>      kernel32.lib
   --runtime-lib <path>   ETCC 运行时库
   --runtime-include <dir> ETCC 运行时头文件
@@ -222,6 +237,8 @@ cmake --build --preset mingw --target check
 - `struct` / `union` 布局、嵌套、成员访问、自引用链表、整体赋值
 - 局部/全局聚合初始化、部分初始化补零、字符串数组长度推导
 - 结构体数组、结构体指针算术、`->` 链式访问
+- `switch`/fallthrough/嵌套 switch、`goto` 跨块跳转、`enum` 常量与作用域
+- `case` 常量、重复 case/default、未知标签等错误诊断
 - 字符串/字符转义、相邻字符串拼接
 - `printf` 宽度、精度、符号、十六进制/八进制/指针/64 位格式
 - include path、include guard、`#pragma once`、命令行宏、条件编译
@@ -231,7 +248,37 @@ cmake --build --preset mingw --target check
 - 预处理输出
 - 后端注册表与未知后端错误
 
-最近一次结果：**68 passed, 0 failed**。
+最近一次结果：**85 passed, 0 failed**。
+
+## 性能：瓶颈在哪里
+
+在本机（Windows x64，LLVM 22.1.8）用 `tests/hello.c` 拆分计时，结果大致为：
+
+| 阶段 | 中位耗时 |
+|---|---:|
+| ETCC 前端（`-S`：预处理/parse/sema/IR 写出） | **~25 ms** |
+| `llc -filetype=obj` 把 IR 汇编成 COFF | **~100 ms** |
+| `lld-link` 链接 | **~250 ms** |
+| 完整 `etcc hello.c`（llc + lld-link） | **~305 ms** |
+| 完整 `etcc hello.c`（llc + MSVC link.exe） | **~198 ms** |
+
+结论：**不是 ETCC 前端慢**。`clang.exe` 约 108 MB、`llc.exe` 约 66 MB、`lld-link.exe` 约 72 MB，Windows 上每次启动它们都要付出固定的进程/加载/扫描成本；Hello World 只有 768 字节目标文件，链接和汇编的固定开销远大于实际代码处理。Cavvy 的 `llc+lld` 比 `clang` 快约 200 ms，也是同一个现象。
+
+已经做的优化：
+
+- LLVM 后端优先使用 **`llc -filetype=obj`** 直接生成 COFF；找不到 llc 时回退到 `clang -cc1`，再回退到常规 `clang -c`。
+- 驱动新增 `--llc` / `ETCC_LLC` 和 `--linker` / `ETCC_LINK`。
+- 使用 MSVC `link.exe` 时，驱动会把 `TMP`/`TEMP` 指向当前目录，避免受限环境下的临时文件问题。
+- `-c` 只生成 COFF，不启动链接器；`-S` 只跑前端。
+
+示例：
+
+```bat
+set ETCC_LINK=<VS>\VC\Tools\MSVC\<version>\bin\Hostx64\x64\link.exe
+build\etcc.exe tests\hello.c -o build\hello.exe
+```
+
+如果追求“彻底摆脱巨无霸”，下一步需要：直接生成 COFF 的原生 x86-64 后端，或把 LLVM/LLD 作为库集成，避免每次编译启动外部进程。当前架构已经把这两条路留在 backend 接口之后，前端不需要改。
 
 ## 目录结构
 
@@ -273,11 +320,12 @@ CMakePresets.json      MinGW Makefiles 配置/构建/测试 preset
 - [后端开发指南](docs/BACKENDS.md)
 - [里程碑 0.1](docs/MILESTONE.md)
 - [里程碑 0.2：聚合类型与初始化器](docs/MILESTONE-0.2.md)
+- [里程碑 0.3：控制流与枚举](docs/MILESTONE-0.3.md)
 
 ## 当前限制（有意留在后续里程碑）
 
 - 目标固定为 **Windows x64 / Microsoft ABI**；宿主也按 Windows 构建。
-- 不支持 `enum`、浮点类型、`switch` / `goto`、函数指针、变参函数**定义**、VLA、位域、`_Atomic`。
+- 不支持浮点类型、函数指针、变参函数**定义**、VLA、位域、`_Atomic`。
 - `struct` / `union` 还不能按值传参或返回（会给出明确诊断）；成员访问/指针/赋值/初始化已可用。
 - 初始化器不支持指定初始化器（`.field =`、`[index] =`）、flexible array member、嵌套花括号省略。
 - 全局聚合初始化暂不支持非空指针重定位（例如 `struct { char *p; } g = { "x" };`）；零指针可以。
@@ -290,10 +338,10 @@ CMakePresets.json      MinGW Makefiles 配置/构建/测试 preset
 
 ## 路线图
 
-1. **类型系统继续扩展**：`enum`、结构体按值传参/返回的 ABI、位域、`_Alignas`。
+1. **类型系统继续扩展**：结构体按值传参/返回的 ABI、位域、`_Alignas`、函数指针。
 2. **初始化器完整化**：指定初始化器、flexible array member、花括号省略、全局指针重定位。
 3. **预处理器完整化**：函数式宏、`#`/`##`、宏展开后的 `-E`、`#line`。
-4. **语言完整性**：`switch`、`goto`、函数指针、变参函数定义、浮点。
+4. **语言完整性**：变参函数定义、浮点。
 5. **运行时扩展**：文件 I/O、`FILE`、更完整的格式化、环境变量、堆调试。
 6. **优化与诊断**：常量折叠、死代码消除、类型检查强化、警告分级。
 7. **新后端**：x86-64 原生后端（直接生成 COFF/PE）、C 后端、WASM 后端；用同一套测试矩阵验证。

@@ -50,7 +50,8 @@ IrModule
   │
   ├─ 序列化为 .ll（target triple = x86_64-pc-windows-msvc）
   │
-  ├─ clang --target=x86_64-pc-windows-msvc -c -x ir ...
+  ├─ llc -mtriple=x86_64-pc-windows-msvc -filetype=obj -O0 ...
+  │     （失败时回退到 clang -cc1，再回退到 clang -c -x ir）
   │
   └─ COFF .obj
 ```
@@ -58,9 +59,12 @@ IrModule
 关键选择：
 
 - 文本 IR 而不是 LLVM C++ API：编译器不链接 LLVM 库，构建轻量，LLVM 版本升级成本低；
+- 优先直接调用 `llc -filetype=obj`，它比 clang driver/cc1 更贴近纯代码生成，进程启动也更轻；
+- 找不到 llc 时回退到 `clang -cc1`，再回退到公开的 `clang -c`；这是为了兼容不同 LLVM 安装；
 - `-O0`：不做优化，保持 IR 到机器码的映射清晰，便于调试；
-- `-ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables`：避免引入宿主 CRT 依赖；
 - 所有指针统一输出 opaque `ptr`，但 IR 指针保留 pointee 供 GEP/未来后端使用。
+
+驱动链接层支持 `--linker` / `ETCC_LINK`，可以换成 MSVC `link.exe`；在 Hello World 上它通常比 `lld-link` 启动更快。后端接口本身不依赖某个链接器。
 
 ## 3. Hello World 的 IR
 
@@ -137,6 +141,8 @@ store i32 4, ptr %y, align 4
 lld-link /nologo /entry:etcc_entry /subsystem:console /nodefaultlib ^
          app.obj etccrt.lib kernel32.lib /out:app.exe
 ```
+
+也可以用 `--linker` / `ETCC_LINK` 换成 MSVC `link.exe`；参数集合相同，驱动会为 `link.exe` 处理 TMP/TEMP。后端的契约始终是“生成 COFF + 遵循下面的符号/ABI 约定”，不绑定具体链接器。
 
 后端必须保证：
 

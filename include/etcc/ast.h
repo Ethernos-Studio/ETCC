@@ -28,11 +28,17 @@ typedef enum EtccAstKind {
     AST_WHILE,
     AST_DO,
     AST_FOR,
+    AST_SWITCH,
+    AST_CASE,
+    AST_DEFAULT,
+    AST_LABEL,
+    AST_GOTO,
     AST_BREAK,
     AST_CONTINUE,
     AST_EXPR_STMT,
     AST_EMPTY,
     AST_INIT_LIST,
+    AST_ENUM_CONST,
 
     AST_INT_LIT,
     AST_CHAR_LIT,
@@ -114,6 +120,37 @@ struct EtccAstNode {
             EtccAstNode *step;
             EtccAstNode *body;
         } for_;
+
+        struct {
+            EtccAstNode *cond;
+            EtccAstNode *body;
+        } switch_;
+
+        struct {
+            EtccAstNode *value;
+            EtccAstNode *body;
+        } case_;
+
+        struct {
+            EtccAstNode *body;
+        } default_;
+
+        struct {
+            const char *name;
+            size_t len;
+            EtccAstNode *body;
+        } label;
+
+        struct {
+            const char *name;
+            size_t len;
+        } goto_;
+
+        struct {
+            const char *name;
+            size_t len;
+            int64_t value;
+        } enum_const;
 
         struct {
             EtccAstNode *expr;

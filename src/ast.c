@@ -22,11 +22,17 @@ const char *etcc_ast_kind_name(EtccAstKind kind) {
     case AST_WHILE: return "while";
     case AST_DO: return "do";
     case AST_FOR: return "for";
+    case AST_SWITCH: return "switch";
+    case AST_CASE: return "case";
+    case AST_DEFAULT: return "default";
+    case AST_LABEL: return "label";
+    case AST_GOTO: return "goto";
     case AST_BREAK: return "break";
     case AST_CONTINUE: return "continue";
     case AST_EXPR_STMT: return "expression-statement";
     case AST_EMPTY: return "empty-statement";
     case AST_INIT_LIST: return "initializer-list";
+    case AST_ENUM_CONST: return "enumerator";
     case AST_INT_LIT: return "integer-literal";
     case AST_CHAR_LIT: return "character-literal";
     case AST_STRING_LIT: return "string-literal";

@@ -14,6 +14,7 @@ typedef struct EtccBackend EtccBackend;
 
 typedef struct EtccBackendOptions {
     const char *clang_path;
+    const char *llc_path;
     bool verbose;
 } EtccBackendOptions;
 

@@ -14,6 +14,7 @@ char *etcc_path_canonical(EtccArena *a, const char *path);
 const char *etcc_path_filename(const char *path);
 char *etcc_get_executable_dir(EtccArena *a);
 char *etcc_make_temp_path(EtccArena *a, const char *extension);
+char *etcc_find_program(EtccArena *a, const char *name);
 
 bool etcc_run_process(char *const argv[], bool verbose);
 void etcc_remove_file_if_exists(const char *path);

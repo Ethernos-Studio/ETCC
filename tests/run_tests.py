@@ -261,6 +261,37 @@ ab 0 0
 1020304 8 16
 4 9
 """,
+        "control": """\
+0 5 6
+100 101 105 999
+two
+three
+i=0
+n=3
+""",
+        "control2": """\
+mode=3
+f=10 20
+total=4321
+nested
+after nested
+two
+""",
+        "goto": """\
+0 1 2 3
+done 3
+pick=3
+j=2
+""",
+        "enums": """\
+0 5 6 11 4
+5 6 0
+10 15
+99
+7
+99
+1
+""",
     }
     for name, expected in feature_expectations.items():
         out = compile_and_run(name, ROOT / "tests" / f"{name}.c")
@@ -373,6 +404,64 @@ ab 0 0
         rr = run([ETCC, src, "-o", WORK / f"{name}.exe"])
         check(
             f"aggregate error {name}",
+            rr.returncode != 0 and needle in rr.stderr,
+            rr.stderr + rr.stdout,
+        )
+
+    # 8c. Control-flow and enum diagnostics.
+    control_errors = [
+        (
+            "case_outside",
+            "int main(void) { case 1: return 0; }\n",
+            "'case' outside of a switch",
+        ),
+        (
+            "duplicate_case",
+            "int main(void) { switch (1) { case 1: break; case 1: break; } return 0; }\n",
+            "duplicate case value",
+        ),
+        (
+            "duplicate_default",
+            "int main(void) { switch (1) { default: break; default: break; } return 0; }\n",
+            "duplicate default label",
+        ),
+        (
+            "case_nonconstant",
+            "int main(void) { int x = 1; switch (1) { case x: break; } return 0; }\n",
+            "case label is not an integer constant",
+        ),
+        (
+            "switch_pointer",
+            "int main(void) { int x = 0; switch (&x) { default: break; } return 0; }\n",
+            "switch expression must have integer type",
+        ),
+        (
+            "goto_missing",
+            "int main(void) { goto nowhere; return 0; }\n",
+            "goto to undefined label",
+        ),
+        (
+            "duplicate_label",
+            "int main(void) { again: ; again: ; return 0; }\n",
+            "duplicate label",
+        ),
+        (
+            "enum_redef",
+            "enum { E_A, E_A };\nint main(void) { return 0; }\n",
+            "redefinition of 'E_A'",
+        ),
+        (
+            "break_outside",
+            "int main(void) { break; return 0; }\n",
+            "'break' outside of a loop or switch",
+        ),
+    ]
+    for name, text, needle in control_errors:
+        src = WORK / f"{name}.c"
+        src.write_text(text, encoding="utf-8")
+        rr = run([ETCC, src, "-o", WORK / f"{name}.exe"])
+        check(
+            f"control error {name}",
             rr.returncode != 0 and needle in rr.stderr,
             rr.stderr + rr.stdout,
         )

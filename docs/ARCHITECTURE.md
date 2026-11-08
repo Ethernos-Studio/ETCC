@@ -59,6 +59,7 @@
 - 语句：复合、`if`、`while`、`do`、`for`、`break`、`continue`、`return`。
 - 解析期维护 typedef 名称表和 tag 名称表（struct/union，按作用域深度）；
 - `struct` / `union` 定义、字段声明、前置声明、自引用指针、匿名聚合；
+- `enum` 定义与枚举常量、`switch`/`case`/`default`、`goto`/标签；
 - 初始化器递归解析为 `AST_INIT_LIST`，支持嵌套、尾随逗号；
 - 错误恢复：语句级同步到 `;` / `}`；顶层同步到声明起点；错误过多时停止。
 - AST 节点、名称、字符串全部落在 arena 中。
@@ -78,7 +79,10 @@
 - 整数提升、常用算术转换、指针算术、赋值兼容性；
 - `struct` / `union` 类型完整性、字段查找、Windows x64 布局（偏移/填充/大小/对齐）；
 - 生成 typed IR：alloca/load/store/gep/bin/cmp/cast/call；
-- 控制流 lowering：`if`、`while`、`do`、`for`、`&&`/`||` 短路、`?:` 都转换为基本块；
+- 控制流 lowering：`if`、`while`、`do`、`for`、`switch`、`goto`、`&&`/`||` 短路、`?:` 都转换为基本块；
+- `switch` 先收集 case/default 并创建目标块，再生成 case 比较链，fallthrough 与 `break` 由块间 `br` 表达；
+- 函数体分析前预扫描标签并为每个标签创建块，`goto` 直接跳转；不可达代码继续生成无前驱死块，保证跳入其内部标签仍然有合法 CFG；
+- 枚举常量作为 `SYM_ENUM_CONST` 进入普通标识符作用域，表达式上下文直接生成 int 常量；
 - 变量声明统一在函数 entry block 分配栈槽，避免循环内重复 alloca；
 - 聚合初始化：局部对象按字段/元素递归写入并补零；全局对象在编译期生成字节镜像；
 - 生成字符串全局对象、全局变量初始化器；
@@ -104,8 +108,10 @@ b->ops->emit_object(b, module, obj_path, diag);
 LLVM 后端的职责非常窄：
 
 1. 把 `IrModule` 序列化为带 `x86_64-pc-windows-msvc` triple 的 LLVM 文本 IR；
-2. 调用 `clang -x ir -c` 生成 COFF；
+2. 优先调用 `llc -filetype=obj` 生成 COFF，其次回退到 `clang -cc1 -emit-obj`，最后回退到公开的 `clang -c -x ir`；
 3. 失败时把诊断交回驱动。
+
+性能上，ETCC 前端处理 Hello World 只需约 20–25 ms；完整编译的固定成本主要来自 `llc.exe`（约 66 MB）、`clang.exe`（约 108 MB）和 `lld-link.exe`（约 72 MB）的进程启动。后端默认走 llc 已减少一层 clang driver 开销；驱动也支持 `--linker`/`ETCC_LINK` 切换到更轻的 MSVC `link.exe`。
 
 它不负责：
 
@@ -269,5 +275,7 @@ __declspec(noreturn) void etcc_entry(void) {
 6. 临时文件放在当前工作目录，若在只读目录运行需要显式指定可写目录（后续可加 `TMPDIR`/输出目录策略）。
 7. 聚合按值传参/返回、位域、指定初始化器、flexible array member 尚未实现。
 8. 全局聚合初始化暂不支持非空指针重定位。
+9. `switch` 目前降级为线性 case 比较链，尚无 jump table 优化；`goto` 的死块策略会生成少量不可达块。
+10. 枚举类型统一按 `int` 表示，尚无底层类型选择/`_Generic` 等机制。
 
 这些债不会阻碍新增后端：后端只消费 IR，不依赖前端内部结构。

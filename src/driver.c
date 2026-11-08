@@ -27,7 +27,9 @@ typedef struct {
     bool save_temps;
     const char *backend_name;
     const char *clang;
+    const char *llc;
     const char *lld_link;
+    const char *linker;
     const char *kernel32;
     const char *runtime_lib;
     const char *runtime_include;
@@ -40,6 +42,7 @@ typedef struct {
     EtccArena *arena;
     EtccDiagnostics *diag;
     const char *clang;
+    const char *llc;
     const char *lld_link;
     const char *kernel32;
     const char *runtime_lib;
@@ -62,7 +65,9 @@ static void usage(FILE *out) {
         "Code generation:\n"
         "  --backend <name>       backend to use (default: llvm)\n"
         "  --clang <path>         clang executable used by the LLVM backend\n"
-        "  --lld-link <path>      lld-link executable\n"
+        "  --llc <path>           llc executable (preferred IR -> COFF path)\n"
+        "  --linker <path>        linker executable (lld-link or MSVC link.exe)\n"
+        "  --lld-link <path>      alias for --linker\n"
         "  --kernel32 <path>      kernel32.lib import library\n"
         "  --runtime-lib <path>   ETCC runtime library\n"
         "  --runtime-include <d>  ETCC runtime include directory\n"
@@ -200,11 +205,22 @@ static bool discover_toolchain(Options *opt, Toolchain *tc) {
                     : (getenv("ETCC_CLANG") && *getenv("ETCC_CLANG")
                            ? etcc_arena_strdup(a, getenv("ETCC_CLANG"))
                            : etcc_arena_strdup(a, "clang"));
-    tc->lld_link = opt->lld_link && *opt->lld_link
-                       ? etcc_arena_strdup(a, opt->lld_link)
-                       : (getenv("ETCC_LLD_LINK") && *getenv("ETCC_LLD_LINK")
-                              ? etcc_arena_strdup(a, getenv("ETCC_LLD_LINK"))
-                              : etcc_arena_strdup(a, "lld-link"));
+    tc->llc = opt->llc && *opt->llc
+                  ? etcc_arena_strdup(a, opt->llc)
+                  : (getenv("ETCC_LLC") && *getenv("ETCC_LLC")
+                         ? etcc_arena_strdup(a, getenv("ETCC_LLC"))
+                         : etcc_find_program(a, "llc"));
+    tc->lld_link = opt->linker && *opt->linker
+                       ? etcc_arena_strdup(a, opt->linker)
+                       : (getenv("ETCC_LINK") && *getenv("ETCC_LINK")
+                              ? etcc_arena_strdup(a, getenv("ETCC_LINK"))
+                              : (opt->lld_link && *opt->lld_link
+                                     ? etcc_arena_strdup(a, opt->lld_link)
+                                     : (getenv("ETCC_LLD_LINK") &&
+                                                *getenv("ETCC_LLD_LINK")
+                                            ? etcc_arena_strdup(
+                                                  a, getenv("ETCC_LLD_LINK"))
+                                            : etcc_arena_strdup(a, "lld-link"))));
 
     if (opt->kernel32 && *opt->kernel32)
         tc->kernel32 = etcc_arena_strdup(a, opt->kernel32);
@@ -223,8 +239,9 @@ static bool discover_toolchain(Options *opt, Toolchain *tc) {
 
     if (tc->verbose) {
         fprintf(stderr, "etcc: clang           = %s\n", tc->clang);
-        fprintf(stderr, "etcc: lld-link        = %s\n", tc->lld_link);
-        fprintf(stderr, "etcc: kernel32.lib    = %s\n",
+        fprintf(stderr, "etcc: llc             = %s\n",
+                tc->llc ? tc->llc : "<not found>");
+        fprintf(stderr, "etcc: linker          = %s\n", tc->lld_link);        fprintf(stderr, "etcc: kernel32.lib    = %s\n",
                 tc->kernel32 ? tc->kernel32 : "<not found>");
         fprintf(stderr, "etcc: runtime library = %s\n",
                 tc->runtime_lib ? tc->runtime_lib : "<not found>");
@@ -365,6 +382,8 @@ static bool parse_args(int argc, char **argv, Options *opt, EtccArena *a,
         continue;                                                             \
     }
         TAKE_OPT("--clang", clang)
+        TAKE_OPT("--llc", llc)
+        TAKE_OPT("--linker", linker)
         TAKE_OPT("--lld-link", lld_link)
         TAKE_OPT("--kernel32", kernel32)
         TAKE_OPT("--runtime-lib", runtime_lib)
@@ -432,6 +451,35 @@ static bool write_text_file(const char *path, const char *data, size_t len) {
     if (len) fwrite(data, 1, len, f);
     if (f != stdout) fclose(f);
     return true;
+}
+
+static bool linker_is_msvc(const char *path) {
+    const char *base = etcc_path_filename(path);
+#ifdef _WIN32
+    return _stricmp(base, "link.exe") == 0;
+#else
+    return strcmp(base, "link.exe") == 0;
+#endif
+}
+
+static bool run_linker(char *const argv[], bool verbose) {
+#ifdef _WIN32
+    /*
+     * MSVC link.exe uses TMP/TEMP for its own scratch files.  In restricted
+     * workspaces the inherited system temp directory may be writable by the
+     * shell but not by child processes; use the current directory (which the
+     * compiler already uses for intermediates) for this invocation.
+     */
+    if (linker_is_msvc(argv[0])) {
+        char cwd[4096];
+        DWORD n = GetCurrentDirectoryA((DWORD)sizeof(cwd), cwd);
+        if (n > 0 && n < sizeof(cwd)) {
+            SetEnvironmentVariableA("TMP", cwd);
+            SetEnvironmentVariableA("TEMP", cwd);
+        }
+    }
+#endif
+    return etcc_run_process(argv, verbose);
 }
 
 int main(int argc, char **argv) {
@@ -513,7 +561,9 @@ int main(int argc, char **argv) {
         etcc_pp_destroy(&pp);
         return 2;
     }
-    EtccBackendOptions bopts = {.clang_path = tc.clang, .verbose = tc.verbose};
+    EtccBackendOptions bopts = {.clang_path = tc.clang,
+                                .llc_path = tc.llc,
+                                .verbose = tc.verbose};
     EtccBackend *backend = entry->create(&arena, &diag, &bopts);
     if (!backend) {
         etcc_pp_destroy(&pp);
@@ -558,7 +608,7 @@ int main(int argc, char **argv) {
                 char *outarg = etcc_arena_printf(&arena, "/out:%s", out_path);
                 link_argv[n - 1] = outarg;
                 link_argv[n] = NULL;
-                ok = etcc_run_process(link_argv, tc.verbose);
+                ok = run_linker(link_argv, tc.verbose);
                 if (!ok)
                     etcc_diag_error_global(&diag, "linker failed for '%s'",
                                            out_path);

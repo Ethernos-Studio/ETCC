@@ -9,6 +9,7 @@ typedef enum {
     SYM_PARAM,
     SYM_GLOBAL_VAR,
     SYM_FUNCTION,
+    SYM_ENUM_CONST,
 } SymbolKind;
 
 typedef struct EtccSymbol {
@@ -21,6 +22,7 @@ typedef struct EtccSymbol {
     IrGlobal *global;
     IrFunction *func;
     IrValue *addr; /* global value or stack slot */
+    int64_t enum_value;
     struct EtccSymbol *next;
 } EtccSymbol;
 
@@ -33,6 +35,25 @@ typedef struct {
     IrBlock *break_block;
     IrBlock *continue_block;
 } EtccLoop;
+
+typedef struct {
+    const char *name;
+    size_t len;
+    IrBlock *block;
+} EtccLabel;
+
+typedef struct {
+    EtccAstNode *node;
+    int64_t value;
+    IrBlock *block;
+} EtccCase;
+
+typedef struct {
+    EtccAstNode *node;
+    IrBlock *end;
+    IrBlock *default_block;
+    ETCC_VEC(EtccCase) cases;
+} EtccSwitch;
 
 typedef struct {
     EtccArena *arena;
@@ -48,6 +69,15 @@ typedef struct {
 
     EtccLoop loops[64];
     int loop_depth;
+
+    IrBlock *breaks[64];
+    int break_depth;
+
+    ETCC_VEC(EtccLabel) labels;
+
+    EtccSwitch switches[32];
+    int switch_depth;
+
     bool failed;
 } EtccSema;
 
@@ -64,6 +94,7 @@ static bool sema_stmt(EtccSema *s, EtccAstNode *n);
 static EtccCType *infer_type(EtccSema *s, EtccAstNode *n);
 static IrType *map_type(EtccSema *s, EtccCType *t, EtccLoc loc);
 static bool type_is_complete_object(const EtccCType *t);
+static bool const_eval(EtccSema *s, EtccAstNode *n, int64_t *out);
 
 static void sema_error(EtccSema *s, EtccLoc loc, const char *fmt, ...) {
     va_list ap;
@@ -245,6 +276,137 @@ static void emit_br(EtccSema *s, IrBlock *target) {
     s->cur = NULL;
 }
 
+static void collect_labels(EtccSema *s, EtccAstNode *n) {
+    if (!n) return;
+    switch (n->kind) {
+    case AST_LABEL: {
+        bool duplicate = false;
+        for (size_t i = 0; i < s->labels.len; i++) {
+            EtccLabel *l = &s->labels.items[i];
+            if (l->len == n->u.label.len &&
+                memcmp(l->name, n->u.label.name, l->len) == 0) {
+                sema_error(s, n->loc, "duplicate label '%.*s'",
+                           (int)n->u.label.len, n->u.label.name);
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            EtccLabel label = {
+                .name = n->u.label.name,
+                .len = n->u.label.len,
+                .block = new_block(s, "label"),
+            };
+            if (!ETCC_VEC_PUSH(s->labels, label))
+                sema_error(s, n->loc, "out of memory");
+        }
+        collect_labels(s, n->u.label.body);
+        return;
+    }
+    case AST_COMPOUND:
+        for (EtccAstNode *st = n->u.compound.stmts; st; st = st->next)
+            collect_labels(s, st);
+        return;
+    case AST_IF:
+        collect_labels(s, n->u.if_.then_branch);
+        collect_labels(s, n->u.if_.else_branch);
+        return;
+    case AST_WHILE:
+        collect_labels(s, n->u.while_.body);
+        return;
+    case AST_DO:
+        collect_labels(s, n->u.do_.body);
+        return;
+    case AST_FOR:
+        collect_labels(s, n->u.for_.body);
+        return;
+    case AST_SWITCH:
+        collect_labels(s, n->u.switch_.body);
+        return;
+    case AST_CASE:
+        collect_labels(s, n->u.case_.body);
+        return;
+    case AST_DEFAULT:
+        collect_labels(s, n->u.default_.body);
+        return;
+    default:
+        return;
+    }
+}
+
+static bool collect_switch_cases(EtccSema *s, EtccAstNode *n, EtccSwitch *sw) {
+    if (!n) return true;
+    switch (n->kind) {
+    case AST_SWITCH:
+        /* Case labels of a nested switch belong to that switch. */
+        return true;
+    case AST_CASE: {
+        int64_t value = 0;
+        if (!n->u.case_.value || !const_eval(s, n->u.case_.value, &value)) {
+            sema_error(s, n->loc, "case label is not an integer constant");
+            return false;
+        }
+        for (size_t i = 0; i < sw->cases.len; i++) {
+            if (sw->cases.items[i].value == value) {
+                sema_error(s, n->loc, "duplicate case value %lld",
+                           (long long)value);
+                return false;
+            }
+        }
+        EtccCase c = {
+            .node = n,
+            .value = value,
+            .block = new_block(s, "switch.case"),
+        };
+        if (!ETCC_VEC_PUSH(sw->cases, c)) {
+            sema_error(s, n->loc, "out of memory");
+            return false;
+        }
+        return collect_switch_cases(s, n->u.case_.body, sw);
+    }
+    case AST_DEFAULT:
+        if (sw->default_block) {
+            sema_error(s, n->loc, "duplicate default label");
+            return false;
+        }
+        sw->default_block = new_block(s, "switch.default");
+        return collect_switch_cases(s, n->u.default_.body, sw);
+    case AST_COMPOUND:
+        for (EtccAstNode *st = n->u.compound.stmts; st; st = st->next) {
+            if (!collect_switch_cases(s, st, sw)) return false;
+        }
+        return true;
+    case AST_IF:
+        return collect_switch_cases(s, n->u.if_.then_branch, sw) &&
+               collect_switch_cases(s, n->u.if_.else_branch, sw);
+    case AST_WHILE:
+        return collect_switch_cases(s, n->u.while_.body, sw);
+    case AST_DO:
+        return collect_switch_cases(s, n->u.do_.body, sw);
+    case AST_FOR:
+        return collect_switch_cases(s, n->u.for_.body, sw);
+    case AST_LABEL:
+        return collect_switch_cases(s, n->u.label.body, sw);
+    default:
+        return true;
+    }
+}
+
+static EtccCase *switch_find_case(EtccSwitch *sw, EtccAstNode *node) {
+    for (size_t i = 0; i < sw->cases.len; i++) {
+        if (sw->cases.items[i].node == node) return &sw->cases.items[i];
+    }
+    return NULL;
+}
+
+static EtccLabel *label_find(EtccSema *s, const char *name, size_t len) {
+    for (size_t i = 0; i < s->labels.len; i++) {
+        EtccLabel *l = &s->labels.items[i];
+        if (l->len == len && memcmp(l->name, name, len) == 0) return l;
+    }
+    return NULL;
+}
+
 static IrValue *zero_of_type(EtccSema *s, IrType *t) {
     if (t->kind == IR_TYPE_PTR) return ir_const_null(s->m, t);
     return ir_const_int(s->m, t, 0);
@@ -384,6 +546,10 @@ static bool sema_lvalue(EtccSema *s, EtccAstNode *n, SemVal *out) {
         }
         if (sym->kind == SYM_FUNCTION) {
             sema_error(s, n->loc, "function '%s' is not an lvalue", name);
+            return false;
+        }
+        if (sym->kind == SYM_ENUM_CONST) {
+            sema_error(s, n->loc, "enumerator '%s' is not an lvalue", name);
             return false;
         }
         out->type = sym->type;
@@ -1056,6 +1222,14 @@ static bool sema_expr(EtccSema *s, EtccAstNode *n, SemVal *out) {
             out->addr = NULL;
             return true;
         }
+        if (sym->kind == SYM_ENUM_CONST) {
+            out->type = etcc_type_builtin(CT_INT);
+            out->value = const_int_typed(s, out->type,
+                                         (uint64_t)sym->enum_value);
+            out->is_null_const = (sym->enum_value == 0);
+            out->addr = NULL;
+            return true;
+        }
         out->type = sym->type;
         out->addr = sym->addr;
         out->value = sym->addr;
@@ -1465,6 +1639,84 @@ static bool initialize_local_object(EtccSema *s, EtccCType *t, IrValue *base,
     return true;
 }
 
+static bool sema_enum_const(EtccSema *s, EtccAstNode *n) {
+    if (!n->u.enum_const.name) return false;
+    if (scope_find_local(s->scope, n->u.enum_const.name)) {
+        sema_error(s, n->loc, "redefinition of '%s'", n->u.enum_const.name);
+        return false;
+    }
+    EtccSymbol *sym = symbol_add(s, s->scope, n->u.enum_const.name,
+                                 etcc_type_builtin(CT_INT), SYM_ENUM_CONST,
+                                 n->loc);
+    sym->enum_value = n->u.enum_const.value;
+    return true;
+}
+
+static bool sema_switch_stmt(EtccSema *s, EtccAstNode *n) {
+    SemVal v;
+    if (!sema_expr(s, n->u.switch_.cond, &v)) return false;
+    if (!decay(s, &v, n->loc)) return false;
+    if (!is_integer(v.type)) {
+        sema_error(s, n->loc, "switch expression must have integer type");
+        return false;
+    }
+    EtccCType *ct = integer_promote(s, v.type);
+    v.value = convert_value(s, v.value, v.type, ct, n->loc, false);
+    v.type = ct;
+
+    if (s->switch_depth >= (int)(sizeof(s->switches) / sizeof(s->switches[0]))) {
+        sema_error(s, n->loc, "switch nesting is too deep");
+        return false;
+    }
+
+    EtccSwitch *sw = &s->switches[s->switch_depth];
+    memset(sw, 0, sizeof(*sw));
+    sw->node = n;
+    sw->end = new_block(s, "switch.end");
+
+    if (!collect_switch_cases(s, n->u.switch_.body, sw)) {
+        free(sw->cases.items);
+        sw->cases.items = NULL;
+        return false;
+    }
+
+    for (size_t i = 0; i < sw->cases.len; i++) {
+        EtccCase *c = &sw->cases.items[i];
+        IrValue *case_value = ir_const_int(s->m, v.value->type,
+                                           (uint64_t)c->value);
+        IrValue *match = ir_build_cmp(s->m, s->cur, IR_CMP_EQ, v.value,
+                                      case_value);
+        IrBlock *next = new_block(s, "switch.next");
+        ir_block_set_cond_br(s->m, s->cur, match, c->block, next);
+        s->cur = next;
+    }
+    IrBlock *fallback = sw->default_block ? sw->default_block : sw->end;
+    ir_block_set_br(s->m, s->cur, fallback);
+    s->cur = NULL;
+
+    IrBlock *body_start = new_block(s, "switch.body");
+    s->cur = body_start;
+    s->switch_depth++;
+
+    if (s->break_depth >= (int)(sizeof(s->breaks) / sizeof(s->breaks[0]))) {
+        sema_error(s, n->loc, "break nesting is too deep");
+        s->switch_depth--;
+        free(sw->cases.items);
+        return false;
+    }
+    s->breaks[s->break_depth++] = sw->end;
+
+    bool ok = sema_stmt(s, n->u.switch_.body);
+    s->break_depth--;
+    s->switch_depth--;
+
+    if (block_open(s)) emit_br(s, sw->end);
+    s->cur = sw->end;
+    free(sw->cases.items);
+    sw->cases.items = NULL;
+    return ok;
+}
+
 static bool sema_local_decl(EtccSema *s, EtccAstNode *n) {
     if (n->u.decl.storage == STORAGE_STATIC) {
         sema_error(s, n->loc,
@@ -1511,15 +1763,22 @@ static bool sema_local_decl(EtccSema *s, EtccAstNode *n) {
 
 static bool sema_decl_list(EtccSema *s, EtccAstNode *decls, bool global) {
     (void)global;
-    for (EtccAstNode *n = decls; n && n->kind == AST_DECL; n = n->next) {
-        if (!sema_local_decl(s, n)) return false;
+    for (EtccAstNode *n = decls;
+         n && (n->kind == AST_DECL || n->kind == AST_ENUM_CONST);
+         n = n->next) {
+        if (n->kind == AST_ENUM_CONST) {
+            if (!sema_enum_const(s, n)) return false;
+        } else if (!sema_local_decl(s, n)) {
+            return false;
+        }
     }
     return true;
 }
 
 static bool sema_for_stmt(EtccSema *s, EtccAstNode *n) {
     if (n->u.for_.init) {
-        if (n->u.for_.init->kind == AST_DECL) {
+        if (n->u.for_.init->kind == AST_DECL ||
+            n->u.for_.init->kind == AST_ENUM_CONST) {
             if (!sema_decl_list(s, n->u.for_.init, false)) return false;
         } else {
             SemVal v;
@@ -1548,6 +1807,11 @@ static bool sema_for_stmt(EtccSema *s, EtccAstNode *n) {
         return false;
     }
     s->loops[s->loop_depth++] = (EtccLoop){end, stepb};
+    if (s->break_depth >= (int)(sizeof(s->breaks) / sizeof(s->breaks[0]))) {
+        sema_error(s, n->loc, "break nesting is too deep");
+        return false;
+    }
+    s->breaks[s->break_depth++] = end;
 
     s->cur = bodyb;
     if (!sema_stmt(s, n->u.for_.body)) return false;
@@ -1559,6 +1823,7 @@ static bool sema_for_stmt(EtccSema *s, EtccAstNode *n) {
         if (!sema_expr(s, n->u.for_.step, &v)) return false;
     }
     if (block_open(s)) emit_br(s, condb);
+    s->break_depth--;
     s->loop_depth--;
     s->cur = end;
     return true;
@@ -1566,13 +1831,60 @@ static bool sema_for_stmt(EtccSema *s, EtccAstNode *n) {
 
 static bool sema_stmt(EtccSema *s, EtccAstNode *n) {
     if (!n) return true;
-    if (!block_open(s)) return true;
+
+    if (n->kind == AST_LABEL) {
+        EtccLabel *label = label_find(s, n->u.label.name, n->u.label.len);
+        if (!label) {
+            sema_error(s, n->loc, "unknown label");
+            return false;
+        }
+        if (block_open(s)) emit_br(s, label->block);
+        s->cur = label->block;
+        return sema_stmt(s, n->u.label.body);
+    }
+
+    if (n->kind == AST_CASE) {
+        if (s->switch_depth == 0) {
+            sema_error(s, n->loc, "'case' outside of a switch");
+            return false;
+        }
+        EtccSwitch *sw = &s->switches[s->switch_depth - 1];
+        EtccCase *c = switch_find_case(sw, n);
+        if (!c) {
+            sema_error(s, n->loc, "'case' label was not collected");
+            return false;
+        }
+        if (block_open(s)) emit_br(s, c->block);
+        s->cur = c->block;
+        return sema_stmt(s, n->u.case_.body);
+    }
+
+    if (n->kind == AST_DEFAULT) {
+        if (s->switch_depth == 0) {
+            sema_error(s, n->loc, "'default' outside of a switch");
+            return false;
+        }
+        EtccSwitch *sw = &s->switches[s->switch_depth - 1];
+        if (!sw->default_block) {
+            sema_error(s, n->loc, "'default' label was not collected");
+            return false;
+        }
+        if (block_open(s)) emit_br(s, sw->default_block);
+        s->cur = sw->default_block;
+        return sema_stmt(s, n->u.default_.body);
+    }
+
+    if (!block_open(s)) {
+        /* Keep lowering syntactically unreachable code so that labels and
+         * case labels inside it still get valid blocks (goto may target them).
+         * The block has no predecessor and is therefore dead. */
+        s->cur = new_block(s, "dead");
+    }
 
     switch (n->kind) {
     case AST_COMPOUND: {
         scope_push(s);
         for (EtccAstNode *st = n->u.compound.stmts; st; st = st->next) {
-            if (!block_open(s)) break;
             if (!sema_stmt(s, st)) {
                 scope_pop(s);
                 return false;
@@ -1581,6 +1893,8 @@ static bool sema_stmt(EtccSema *s, EtccAstNode *n) {
         scope_pop(s);
         return true;
     }
+    case AST_ENUM_CONST:
+        return sema_enum_const(s, n);
     case AST_DECL:
         return sema_local_decl(s, n);
     case AST_EXPR_STMT:
@@ -1617,6 +1931,18 @@ static bool sema_stmt(EtccSema *s, EtccAstNode *n) {
         v.value = convert_value(s, v.value, v.type, s->fn_ret, n->loc, false);
         if (block_open(s)) ir_block_set_ret(s->m, s->cur, v.value);
         s->cur = NULL;
+        return true;
+    }
+    case AST_SWITCH:
+        return sema_switch_stmt(s, n);
+    case AST_GOTO: {
+        EtccLabel *label = label_find(s, n->u.goto_.name, n->u.goto_.len);
+        if (!label) {
+            sema_error(s, n->loc, "goto to undefined label '%.*s'",
+                       (int)n->u.goto_.len, n->u.goto_.name);
+            return false;
+        }
+        emit_br(s, label->block);
         return true;
     }
     case AST_IF: {
@@ -1658,9 +1984,15 @@ static bool sema_stmt(EtccSema *s, EtccAstNode *n) {
             return false;
         }
         s->loops[s->loop_depth++] = (EtccLoop){end, condb};
+        if (s->break_depth >= (int)(sizeof(s->breaks) / sizeof(s->breaks[0]))) {
+            sema_error(s, n->loc, "break nesting is too deep");
+            return false;
+        }
+        s->breaks[s->break_depth++] = end;
         s->cur = bodyb;
         if (!sema_stmt(s, n->u.while_.body)) return false;
         if (block_open(s)) emit_br(s, condb);
+        s->break_depth--;
         s->loop_depth--;
         s->cur = end;
         return true;
@@ -1676,10 +2008,16 @@ static bool sema_stmt(EtccSema *s, EtccAstNode *n) {
             return false;
         }
         s->loops[s->loop_depth++] = (EtccLoop){end, condb};
+        if (s->break_depth >= (int)(sizeof(s->breaks) / sizeof(s->breaks[0]))) {
+            sema_error(s, n->loc, "break nesting is too deep");
+            return false;
+        }
+        s->breaks[s->break_depth++] = end;
 
         s->cur = bodyb;
         if (!sema_stmt(s, n->u.do_.body)) return false;
         if (block_open(s)) emit_br(s, condb);
+        s->break_depth--;
         s->loop_depth--;
 
         s->cur = condb;
@@ -1696,11 +2034,11 @@ static bool sema_stmt(EtccSema *s, EtccAstNode *n) {
         return ok;
     }
     case AST_BREAK:
-        if (s->loop_depth == 0) {
-            sema_error(s, n->loc, "'break' outside of a loop");
+        if (s->break_depth == 0) {
+            sema_error(s, n->loc, "'break' outside of a loop or switch");
             return false;
         }
-        emit_br(s, s->loops[s->loop_depth - 1].break_block);
+        emit_br(s, s->breaks[s->break_depth - 1]);
         return true;
     case AST_CONTINUE:
         if (s->loop_depth == 0) {
@@ -1725,6 +2063,16 @@ static bool const_eval(EtccSema *s, EtccAstNode *n, int64_t *out) {
     case AST_CHAR_LIT:
         *out = n->u.char_lit.value;
         return true;
+    case AST_IDENT: {
+        char *name = etcc_arena_strndup(s->arena, n->u.ident.name,
+                                        n->u.ident.len);
+        EtccSymbol *sym = scope_lookup(s, name);
+        if (sym && sym->kind == SYM_ENUM_CONST) {
+            *out = sym->enum_value;
+            return true;
+        }
+        return false;
+    }
     case AST_UNARY: {
         int64_t v;
         if (!const_eval(s, n->u.unary.operand, &v)) return false;
@@ -2030,6 +2378,8 @@ static bool collect_globals(EtccSema *s, EtccAstNode *tu) {
             if (!collect_function(s, n->u.func.name, n->u.func.type,
                                   n->u.func.storage, true, n->loc))
                 return false;
+        } else if (n->kind == AST_ENUM_CONST) {
+            if (!sema_enum_const(s, n)) return false;
         } else if (n->kind == AST_DECL) {
             if (n->u.decl.type && n->u.decl.type->kind == CT_FUNC) {
                 if (!collect_function(s, n->u.decl.name, n->u.decl.type,
@@ -2130,6 +2480,9 @@ static bool analyze_function(EtccSema *s, EtccAstNode *n) {
     s->fn_ret = n->u.func.type->base;
     s->block_id = 0;
     s->loop_depth = 0;
+    s->break_depth = 0;
+    s->switch_depth = 0;
+    s->labels.len = 0;
     s->cur = NULL;
 
     if (f->variadic) {
@@ -2173,6 +2526,7 @@ static bool analyze_function(EtccSema *s, EtccAstNode *n) {
 
     ir_function_begin(s->m, f);
     s->cur = f->entry;
+    collect_labels(s, n->u.func.body);
     scope_push(s);
 
     size_t expected = n->u.func.type->nparams;
@@ -2223,6 +2577,10 @@ static bool analyze_function(EtccSema *s, EtccAstNode *n) {
     s->fn = NULL;
     s->fn_ret = NULL;
     s->cur = NULL;
+    free(s->labels.items);
+    s->labels.items = NULL;
+    s->labels.len = 0;
+    s->labels.cap = 0;
     return true;
 }
 
