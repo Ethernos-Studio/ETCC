@@ -176,6 +176,7 @@ static char *find_runtime_include(EtccArena *a, const char *exe_dir,
         "runtime\\include",
         "..\\runtime\\include",
         "..\\..\\runtime\\include",
+        "..\\include",
     };
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
         char *p = etcc_path_join(a, exe_dir, candidates[i]);

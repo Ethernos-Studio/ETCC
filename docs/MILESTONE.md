@@ -18,7 +18,8 @@
 ## 复现
 
 ```bat
-mingw32-make
+cmake --preset mingw
+cmake --build --preset mingw
 build\etcc.exe tests\hello.c -o build\hello.exe
 build\hello.exe
 ```

@@ -44,17 +44,17 @@ preprocessor ──► lexer ──► parser ──► semantic analysis
 | 组件 | 用途 | 本机验证版本 |
 |---|---|---|
 | Windows 10/11 x64 | 目标平台 | Windows |
+| CMake | 构建系统 | 4.4.4 |
 | MinGW-w64 GCC | 编译编译器本身 | 16.2.0 |
 | LLVM / Clang / LLD | LLVM 后端、COFF 汇编与链接 | 22.1.8 |
 | Windows SDK | `kernel32.lib` | 10.0.26100.0 |
-| GNU Make (`mingw32-make`) | 构建 | — |
 | Python 3 | 端到端测试 | 3.15 |
 
 ### 构建
 
 ```bat
-mingw32-make
-mingw32-make test
+cmake --preset mingw
+cmake --build --preset mingw
 ```
 
 构建产物：
@@ -62,6 +62,20 @@ mingw32-make test
 ```text
 build\etcc.exe              编译器驱动
 build\runtime\etccrt.lib    自己的 C 运行时（crt0 + libc 子集）
+```
+
+`cmake --preset mingw` 使用 **MinGW Makefiles** 生成器，并固定使用 `gcc` 构建编译器；运行时由 Clang 编译、`llvm-lib` 归档。可用 `-DETCC_CLANG=<path>` / `-DETCC_LLVM_LIB=<path>` 覆盖运行时工具链。若不用 preset，也可：
+
+```bat
+cmake -G "MinGW Makefiles" -S . -B build -DCMAKE_C_COMPILER=gcc
+cmake --build build
+```
+
+安装到指定前缀（会得到 `bin/etcc.exe`、`lib/etccrt.lib`、`include/*.h`，驱动能按安装布局自动发现运行时）：
+
+```bat
+cmake --install build --prefix build\install
+build\install\bin\etcc.exe tests\hello.c -o build\install\hello.exe
 ```
 
 ### 编译并运行
@@ -189,7 +203,13 @@ etcc [options] <input.c>
 ## 测试
 
 ```bat
-mingw32-make test
+ctest --preset mingw
+```
+
+等价地：
+
+```bat
+cmake --build --preset mingw --target check
 ```
 
 测试覆盖：
@@ -233,6 +253,8 @@ runtime/include/       自己的 C 库头文件
 runtime/src/           自己的 crt0 + libc 实现
 tests/                 端到端测试与测试驱动
 docs/                  架构与后端开发文档
+CMakeLists.txt         CMake 构建定义
+CMakePresets.json      MinGW Makefiles 配置/构建/测试 preset
 ```
 
 ## 设计要点

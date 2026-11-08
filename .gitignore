@@ -2,3 +2,4 @@
 .etcc-*
 *.pdb
 __pycache__/
+CMakeUserPresets.json

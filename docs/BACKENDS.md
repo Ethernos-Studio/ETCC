@@ -246,8 +246,11 @@ etcc --backend native tests\hello.c -o build\hello.exe
 现有测试是端到端黑盒，只要新后端能生成 COFF 并链接运行，直接跑：
 
 ```bat
-mingw32-make test
+cmake --build --preset mingw
+ctest --preset mingw
 ```
+
+或用 `cmake --build --preset mingw --target check` 一次完成构建 + 测试。
 
 额外建议：
 

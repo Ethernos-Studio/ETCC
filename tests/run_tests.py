@@ -10,8 +10,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ETCC = ROOT / "build" / "etcc.exe"
-WORK = ROOT / "build" / "tests"
+ETCC = Path(os.environ.get("ETCC", ROOT / "build" / "etcc.exe"))
+WORK = Path(os.environ.get("ETCC_TEST_WORK", ROOT / "build" / "tests"))
 LLVM_READOBJ = shutil.which("llvm-readobj")
 
 passed = 0
@@ -87,7 +87,7 @@ def compile_and_run(name: str, source: Path, extra=None, args=None):
 
 def main() -> int:
     if not ETCC.exists():
-        print(f"error: compiler not found at {ETCC}; run mingw32-make first")
+        print(f"error: compiler not found at {ETCC}; run the CMake build first")
         return 1
 
     if WORK.exists():
