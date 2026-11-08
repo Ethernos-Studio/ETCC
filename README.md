@@ -101,6 +101,7 @@ ETCC_RUNTIME_INCLUDE
 - `long` / `unsigned long`（Windows LLP64：32 位）
 - `long long` / `unsigned long long`
 - 多级指针、多维数组、函数类型
+- `struct` / `union`：具名/匿名标签、前置声明、自引用指针、嵌套、数组、成员布局与对齐
 - `const` / `volatile` / `restrict` 限定符（`const` 参与类型表示）
 - `typedef`
 
@@ -120,8 +121,22 @@ ETCC_RUNTIME_INCLUDE
 - 前置/后置 `++` / `--`
 - 三元表达式、逗号表达式
 - 函数调用、数组下标、`&` / `*`
+- `struct` / `union` 成员访问：`.`、`->`、嵌套成员、成员数组
+- `struct` / `union` 整体赋值
 - 显式类型转换、`sizeof(type)` / `sizeof expr`
 - 整数提升、常用算术转换、指针算术、指针相减
+
+### 聚合类型与初始化器
+
+- 具名 `struct` / `union`、匿名定义、`typedef struct { ... } Name`
+- 前置声明 `struct S;`、自引用 `struct Node { struct Node *next; };`
+- Windows x64 自然对齐布局：字段偏移、填充、结构体/联合体大小
+- 结构体/联合体指针、结构体数组、嵌套结构体
+- `s.x`、`p->x`、`s.a.b`、`p->a[i].x`
+- `struct S a = b;` 整体复制
+- 局部与全局的 `{ ... }` 聚合初始化，支持嵌套、部分初始化补零
+- `char s[] = "abc"`、`char buf[8] = "hi"`、`int a[] = {1, 2, 3}` 长度推导
+- 全局整数/字符数组、结构体、联合体初始化（编译期写为静态字节数据）
 
 ### 预处理器
 
@@ -184,6 +199,9 @@ mingw32-make test
 - `argc/argv`
 - 表达式、控制流、递归、作用域、位运算、64 位整数
 - 数组、二级指针、指针算术、显式类型转换
+- `struct` / `union` 布局、嵌套、成员访问、自引用链表、整体赋值
+- 局部/全局聚合初始化、部分初始化补零、字符串数组长度推导
+- 结构体数组、结构体指针算术、`->` 链式访问
 - 字符串/字符转义、相邻字符串拼接
 - `printf` 宽度、精度、符号、十六进制/八进制/指针/64 位格式
 - include path、include guard、`#pragma once`、命令行宏、条件编译
@@ -193,7 +211,7 @@ mingw32-make test
 - 预处理输出
 - 后端注册表与未知后端错误
 
-最近一次结果：**49 passed, 0 failed**。
+最近一次结果：**68 passed, 0 failed**。
 
 ## 目录结构
 
@@ -231,13 +249,17 @@ docs/                  架构与后端开发文档
 
 - [架构说明](docs/ARCHITECTURE.md)
 - [后端开发指南](docs/BACKENDS.md)
-- [里程碑记录](docs/MILESTONE.md)
+- [里程碑 0.1](docs/MILESTONE.md)
+- [里程碑 0.2：聚合类型与初始化器](docs/MILESTONE-0.2.md)
 
 ## 当前限制（有意留在后续里程碑）
 
 - 目标固定为 **Windows x64 / Microsoft ABI**；宿主也按 Windows 构建。
-- 不支持 `struct` / `union` / `enum`、浮点类型、`switch` / `goto`、函数指针、变参函数**定义**、VLA、位域、`_Atomic`。
-- 不支持花括号初始化器；全局数组初始化也暂未实现。
+- 不支持 `enum`、浮点类型、`switch` / `goto`、函数指针、变参函数**定义**、VLA、位域、`_Atomic`。
+- `struct` / `union` 还不能按值传参或返回（会给出明确诊断）；成员访问/指针/赋值/初始化已可用。
+- 初始化器不支持指定初始化器（`.field =`、`[index] =`）、flexible array member、嵌套花括号省略。
+- 全局聚合初始化暂不支持非空指针重定位（例如 `struct { char *p; } g = { "x" };`）；零指针可以。
+- 局部 `static` 变量暂未实现。
 - 预处理器暂不支持函数式宏、`#` / `##`、`_Pragma`；`-E` 输出是 include/条件编译后的源码，对象宏仍在词法阶段展开，因此 `-E` 文本中不会展开对象宏。
 - 一次只接受一个输入文件。
 - 没有优化管线，后端以 `-O0` 汇编 IR。
@@ -246,8 +268,8 @@ docs/                  架构与后端开发文档
 
 ## 路线图
 
-1. **类型系统扩展**：`struct` / `union` / `enum`、成员访问、结构体按值传参/返回、`typedef` 作用域完善。
-2. **初始化器**：数组/结构体花括号初始化、字符串数组长度推导、全局聚合初始化。
+1. **类型系统继续扩展**：`enum`、结构体按值传参/返回的 ABI、位域、`_Alignas`。
+2. **初始化器完整化**：指定初始化器、flexible array member、花括号省略、全局指针重定位。
 3. **预处理器完整化**：函数式宏、`#`/`##`、宏展开后的 `-E`、`#line`。
 4. **语言完整性**：`switch`、`goto`、函数指针、变参函数定义、浮点。
 5. **运行时扩展**：文件 I/O、`FILE`、更完整的格式化、环境变量、堆调试。

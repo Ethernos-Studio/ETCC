@@ -46,6 +46,19 @@ IrType *ir_type_array(IrModule *m, IrType *elem, uint64_t count) {
     return t;
 }
 
+IrType *ir_type_struct(IrModule *m, size_t size, size_t align) {
+    IrType *t = etcc_arena_alloc(m->arena, sizeof(*t), _Alignof(IrType));
+    *t = (IrType){
+        IR_TYPE_STRUCT,
+        size,
+        align ? align : 1,
+        false,
+        NULL,
+        0,
+    };
+    return t;
+}
+
 static IrValue *new_value(IrModule *m, IrType *type, IrValueKind kind) {
     IrValue *v = etcc_arena_alloc(m->arena, sizeof(*v), _Alignof(IrValue));
     memset(v, 0, sizeof(*v));
@@ -218,9 +231,11 @@ IrValue *ir_build_alloca(IrModule *m, IrFunction *fn, IrType *type) {
     return in->result;
 }
 
-IrValue *ir_build_load(IrModule *m, IrBlock *b, IrValue *ptr) {
+IrValue *ir_build_load(IrModule *m, IrBlock *b, IrValue *ptr,
+                       IrType *type) {
     if (!ptr || !ptr->type || ptr->type->kind != IR_TYPE_PTR) return NULL;
-    IrInstr *in = instr_new(m, b, IR_OP_LOAD, ptr->type->elem, true);
+    if (!type) type = ptr->type->elem;
+    IrInstr *in = instr_new(m, b, IR_OP_LOAD, type, true);
     in->u.load.ptr = ptr;
     return in->result;
 }
@@ -317,6 +332,9 @@ const char *ir_type_name(const IrType *t, char *buf, size_t size) {
     case IR_TYPE_I32: return "i32";
     case IR_TYPE_I64: return "i64";
     case IR_TYPE_PTR: snprintf(buf, size, "ptr"); return buf;
+    case IR_TYPE_STRUCT:
+        snprintf(buf, size, "{ %zu bytes }", t->size);
+        return buf;
     case IR_TYPE_ARRAY: {
         char inner[64];
         const char *ename =

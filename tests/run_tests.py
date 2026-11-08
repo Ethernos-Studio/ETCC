@@ -209,6 +209,58 @@ octal=65
 [Z][%][0x0]
 [123456][1234567890123][99]
 """,
+        "structs": """\
+3 4 8
+10 20
+10 20 99 20
+1 2 3 4 16
+4 1
+nodes=1 2
+""",
+        "structs2": """\
+6
+1 3
+3
+20
+51
+""",
+        "structs3": """\
+11
+1 2
+3 4 5 6 7
+8 20
+3 99
+""",
+        "structs4": """\
+1 2 3 4
+3 8
+9 8 1
+9 10
+9 10
+2
+""",
+        "aggregates": """\
+7 8
+1 4 5
+hello hi 6
+1 2 8
+9 10 12
+world 6 abc
+16909060 4
+11223344
+4 4
+abc 42
+""",
+        "aggregates2": """\
+1 0 2
+3 0 0 0
+4 0 5
+ab 0 0
+""",
+        "unions": """\
+1020304 8 16
+4 9
+""",
     }
     for name, expected in feature_expectations.items():
         out = compile_and_run(name, ROOT / "tests" / f"{name}.c")
@@ -280,6 +332,50 @@ octal=65
         and "bad.c:2" in r.stderr,
         r.stderr,
     )
+
+    # 8b. Aggregate diagnostics.
+    aggregate_errors = [
+        (
+            "by_value",
+            "struct S { int x; };\n"
+            "int f(struct S s) { return s.x; }\n"
+            "int main(void) { return 0; }\n",
+            "passing struct/union by value",
+        ),
+        (
+            "incomplete",
+            "struct S;\n"
+            "int main(void) { struct S s; return 0; }\n",
+            "incomplete type",
+        ),
+        (
+            "too_long",
+            "int main(void) { char s[2] = \"abc\"; return 0; }\n",
+            "too long",
+        ),
+        (
+            "redefined",
+            "struct S { int x; };\n"
+            "struct S { int y; };\n"
+            "int main(void) { return 0; }\n",
+            "redefinition of struct",
+        ),
+        (
+            "missing_member",
+            "struct S { int x; };\n"
+            "int main(void) { struct S s; return s.y; }\n",
+            "no member named 'y'",
+        ),
+    ]
+    for name, text, needle in aggregate_errors:
+        src = WORK / f"{name}.c"
+        src.write_text(text, encoding="utf-8")
+        rr = run([ETCC, src, "-o", WORK / f"{name}.exe"])
+        check(
+            f"aggregate error {name}",
+            rr.returncode != 0 and needle in rr.stderr,
+            rr.stderr + rr.stdout,
+        )
 
     # 9. Conditional compilation and #if 0 skipping.
     cond = WORK / "cond.c"

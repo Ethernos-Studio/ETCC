@@ -13,6 +13,13 @@ typedef struct {
 } TypedefEntry;
 
 typedef struct {
+    EtccCTypeKind kind; /* CT_STRUCT or CT_UNION */
+    const char *name;
+    EtccCType *type;
+    int depth;
+} TagEntry;
+
+typedef struct {
     EtccCType *type;
     EtccStorageClass storage;
     bool saw_type;
@@ -36,11 +43,14 @@ typedef struct EtccParser {
     EtccToken peeked;
     bool has_peeked;
     ETCC_VEC(TypedefEntry) typedefs;
+    ETCC_VEC(TagEntry) tags;
+    int tag_depth;
     bool fatal;
 } EtccParser;
 
 static EtccAstNode *parse_expression(EtccParser *p);
 static EtccAstNode *parse_assignment(EtccParser *p);
+static EtccAstNode *parse_initializer(EtccParser *p);
 static EtccAstNode *parse_cast(EtccParser *p);
 static EtccAstNode *parse_statement(EtccParser *p);
 static EtccAstNode *parse_compound(EtccParser *p);
@@ -48,6 +58,7 @@ static EtccCType *parse_type_name(EtccParser *p);
 static Declarator parse_declarator(EtccParser *p, EtccCType *base,
                                    bool abstract);
 static bool parse_decl_specifiers(EtccParser *p, DeclSpec *ds);
+static EtccCType *parse_struct_union_specifier(EtccParser *p, bool is_union);
 
 static void parser_error(EtccParser *p, EtccLoc loc, const char *fmt, ...) {
     if (p->fatal) return;
@@ -131,6 +142,44 @@ static void typedef_add(EtccParser *p, const char *name, EtccCType *type) {
 static bool is_typedef_token(const EtccParser *p, EtccToken t) {
     return t.kind == TK_IDENT &&
            typedef_lookup(p, t.v.ident.data, t.v.ident.len) != NULL;
+}
+
+static TagEntry *tag_find_nearest(EtccParser *p, EtccCTypeKind kind,
+                                  const char *name, size_t len) {
+    for (size_t i = p->tags.len; i > 0; i--) {
+        TagEntry *e = &p->tags.items[i - 1];
+        if (e->kind != kind) continue;
+        size_t n = strlen(e->name);
+        if (n == len && memcmp(e->name, name, n) == 0) return e;
+    }
+    return NULL;
+}
+
+static TagEntry *tag_find_current(EtccParser *p, EtccCTypeKind kind,
+                                  const char *name, size_t len) {
+    for (size_t i = p->tags.len; i > 0; i--) {
+        TagEntry *e = &p->tags.items[i - 1];
+        if (e->depth != p->tag_depth) continue;
+        if (e->kind != kind) continue;
+        size_t n = strlen(e->name);
+        if (n == len && memcmp(e->name, name, n) == 0) return e;
+    }
+    return NULL;
+}
+
+static TagEntry *tag_add(EtccParser *p, EtccCTypeKind kind, const char *name,
+                         size_t len, EtccCType *type) {
+    TagEntry e = {
+        .kind = kind,
+        .name = etcc_arena_strndup(p->arena, name, len),
+        .type = type,
+        .depth = p->tag_depth,
+    };
+    if (!ETCC_VEC_PUSH(p->tags, e)) {
+        parser_error(p, p->cur.loc, "out of memory");
+        return NULL;
+    }
+    return &p->tags.items[p->tags.len - 1];
 }
 
 static bool token_starts_type(const EtccParser *p, EtccToken t) {
@@ -277,6 +326,137 @@ static bool parse_const_int(EtccParser *p, int64_t *out) {
     return true;
 }
 
+static bool field_name_exists(const EtccField *fields, const char *name,
+                              size_t len) {
+    for (const EtccField *f = fields; f; f = f->next) {
+        size_t n = strlen(f->name);
+        if (n == len && memcmp(f->name, name, n) == 0) return true;
+    }
+    return false;
+}
+
+static bool field_type_incomplete(const EtccCType *t) {
+    if (!t) return true;
+    if (t->kind == CT_VOID || t->kind == CT_FUNC) return true;
+    if ((t->kind == CT_STRUCT || t->kind == CT_UNION) && !t->is_complete)
+        return true;
+    if (t->kind == CT_ARRAY)
+        return t->array_len == 0 || field_type_incomplete(t->base);
+    return false;
+}
+
+static EtccCType *parse_struct_union_specifier(EtccParser *p, bool is_union) {
+    EtccCTypeKind kind = is_union ? CT_UNION : CT_STRUCT;
+    EtccLoc loc = p->cur.loc;
+    parser_advance(p); /* struct / union */
+
+    char *tag = NULL;
+    size_t tag_len = 0;
+    if (check(p, TK_IDENT)) {
+        tag = ident_text(p, p->cur);
+        tag_len = p->cur.v.ident.len;
+        parser_advance(p);
+    }
+
+    if (check(p, TK_LBRACE)) {
+        parser_advance(p);
+        EtccCType *type = NULL;
+
+        if (tag) {
+            TagEntry *existing = tag_find_current(p, kind, tag, tag_len);
+            if (existing) {
+                if (existing->type->is_complete) {
+                    parser_error(p, loc, "redefinition of %s '%s'",
+                                 is_union ? "union" : "struct", tag);
+                    type = etcc_type_struct(p->arena, kind, tag);
+                } else {
+                    type = existing->type;
+                }
+            } else {
+                type = etcc_type_struct(p->arena, kind, tag);
+                tag_add(p, kind, tag, tag_len, type);
+            }
+        } else {
+            type = etcc_type_struct(p->arena, kind, NULL);
+        }
+
+        EtccField *head = NULL, *tail = NULL;
+        size_t field_count = 0;
+
+        while (!check(p, TK_RBRACE) && !check(p, TK_EOF) && !p->fatal) {
+            DeclSpec fds;
+            if (!parse_decl_specifiers(p, &fds)) {
+                parser_error(p, p->cur.loc, "expected a struct/union field declaration");
+                recover_statement(p);
+                continue;
+            }
+            if (fds.storage != STORAGE_NONE) {
+                parser_error(p, p->cur.loc,
+                             "storage class is not allowed on a struct/union field");
+            }
+            if (check(p, TK_SEMICOLON)) {
+                parser_error(p, p->cur.loc, "field declaration has no name");
+                parser_advance(p);
+                continue;
+            }
+
+            for (;;) {
+                Declarator d = parse_declarator(p, fds.type, false);
+                if (!d.name) {
+                    parser_error(p, d.loc, "struct/union field has no name");
+                } else if (field_type_incomplete(d.type)) {
+                    parser_error(p, d.loc,
+                                 "field '%s' has incomplete or invalid type",
+                                 d.name);
+                } else if (field_name_exists(head, d.name, strlen(d.name))) {
+                    parser_error(p, d.loc, "duplicate field '%s'", d.name);
+                } else {
+                    EtccField *f = etcc_field_new(p->arena, d.name, d.type);
+                    if (tail) tail->next = f;
+                    else head = f;
+                    tail = f;
+                    field_count++;
+                }
+
+                if (check(p, TK_COLON)) {
+                    parser_error(p, p->cur.loc,
+                                 "bit-fields are not supported yet");
+                    parser_advance(p);
+                    parse_assignment(p);
+                }
+                if (check(p, TK_ASSIGN)) {
+                    parser_error(p, p->cur.loc,
+                                 "struct/union fields cannot have initializers");
+                    parser_advance(p);
+                    parse_initializer(p);
+                }
+                if (!accept(p, TK_COMMA)) break;
+            }
+            if (!expect(p, TK_SEMICOLON, "';'")) recover_statement(p);
+        }
+        expect(p, TK_RBRACE, "'}'");
+        if (field_count == 0)
+            parser_error(p, loc, "empty %s is not supported",
+                         is_union ? "union" : "struct");
+        if (!etcc_type_define(p->arena, type, head))
+            parser_error(p, loc, "cannot lay out %s",
+                         is_union ? "union" : "struct");
+        return type;
+    }
+
+    if (!tag) {
+        parser_error(p, loc, "expected a struct/union tag or a definition");
+        return etcc_type_builtin(CT_INT);
+    }
+
+    TagEntry *e = tag_find_nearest(p, kind, tag, tag_len);
+    if (e) return e->type;
+
+    EtccCType *type = etcc_type_struct(p->arena, kind, tag);
+    tag_add(p, kind, tag, tag_len, type);
+    return type;
+}
+
 static bool parse_decl_specifiers(EtccParser *p, DeclSpec *ds) {
     memset(ds, 0, sizeof(*ds));
     bool saw_signed = false, saw_unsigned = false;
@@ -391,9 +571,21 @@ static bool parse_decl_specifiers(EtccParser *p, DeclSpec *ds) {
             parser_advance(p);
             continue;
         }
-        if (k == TK_KW_STRUCT || k == TK_KW_UNION || k == TK_KW_ENUM) {
+        if (k == TK_KW_STRUCT || k == TK_KW_UNION) {
+            if (explicit_type || saw_signed || saw_unsigned || saw_char ||
+                saw_short || saw_int || long_count || saw_void || saw_bool ||
+                saw_float || saw_double) {
+                parser_error(p, p->cur.loc,
+                             "cannot combine a struct/union with other type specifiers");
+            }
+            explicit_type = parse_struct_union_specifier(p, k == TK_KW_UNION);
+            ds->saw_type = true;
+            any = true;
+            continue;
+        }
+        if (k == TK_KW_ENUM) {
             parser_error(p, p->cur.loc,
-                         "struct/union/enum types are not supported yet");
+                         "enum types are not supported yet");
             parser_advance(p);
             if (check(p, TK_IDENT)) parser_advance(p);
             if (check(p, TK_LBRACE)) skip_balanced(p, TK_LBRACE, TK_RBRACE);
@@ -1003,6 +1195,46 @@ static EtccAstNode *parse_assignment(EtccParser *p) {
     return lhs;
 }
 
+static EtccAstNode *parse_initializer(EtccParser *p) {
+    if (!check(p, TK_LBRACE)) return parse_assignment(p);
+
+    EtccLoc loc = p->cur.loc;
+    parser_advance(p);
+    EtccAstNode *n = etcc_ast_new(p->arena, AST_INIT_LIST, loc);
+    EtccAstNode *head = NULL, *tail = NULL;
+
+    if (!check(p, TK_RBRACE)) {
+        for (;;) {
+            if (check(p, TK_DOT)) {
+                parser_error(p, p->cur.loc,
+                             "designated initializers are not supported yet");
+                parser_advance(p);
+                if (check(p, TK_IDENT)) parser_advance(p);
+                if (accept(p, TK_ASSIGN)) {
+                }
+            } else if (check(p, TK_LBRACKET)) {
+                parser_error(p, p->cur.loc,
+                             "array designators are not supported yet");
+                skip_balanced(p, TK_LBRACKET, TK_RBRACKET);
+                if (accept(p, TK_ASSIGN)) {
+                }
+            }
+
+            EtccAstNode *item = parse_initializer(p);
+            if (item) {
+                if (tail) tail->next = item;
+                else head = item;
+                tail = item;
+            }
+            if (!accept(p, TK_COMMA)) break;
+            if (check(p, TK_RBRACE)) break;
+        }
+    }
+    expect(p, TK_RBRACE, "'}'");
+    n->u.init_list.items = head;
+    return n;
+}
+
 static EtccAstNode *parse_expression(EtccParser *p) {
     EtccAstNode *e = parse_assignment(p);
     while (e && check(p, TK_COMMA)) {
@@ -1092,13 +1324,7 @@ static EtccAstNode *parse_statement(EtccParser *p) {
                         dn->u.decl.is_definition = true;
                         if (check(p, TK_ASSIGN)) {
                             parser_advance(p);
-                            if (check(p, TK_LBRACE)) {
-                                parser_error(p, p->cur.loc,
-                                             "brace initializers are not supported yet");
-                                skip_balanced(p, TK_LBRACE, TK_RBRACE);
-                            } else {
-                                dn->u.decl.init = parse_assignment(p);
-                            }
+                            dn->u.decl.init = parse_initializer(p);
                         }
                         if (tail) tail->next = dn;
                         else head = dn;
@@ -1172,12 +1398,20 @@ static EtccAstNode *parse_compound(EtccParser *p) {
     EtccLoc loc = p->cur.loc;
     if (!expect(p, TK_LBRACE, "'{'")) return NULL;
     size_t typedef_mark = p->typedefs.len;
+    size_t tag_mark = p->tags.len;
+    int old_tag_depth = p->tag_depth;
+    p->tag_depth++;
     EtccAstNode *head = NULL, *tail = NULL;
 
     while (!check(p, TK_RBRACE) && !check(p, TK_EOF) && !p->fatal) {
         if (is_decl_start(p)) {
             DeclSpec ds;
             if (!parse_decl_specifiers(p, &ds)) {
+                parser_advance(p);
+                continue;
+            }
+            if (check(p, TK_SEMICOLON)) {
+                /* A tag declaration such as `struct S;` has no declarator. */
                 parser_advance(p);
                 continue;
             }
@@ -1200,13 +1434,7 @@ static EtccAstNode *parse_compound(EtccParser *p) {
                     dn->u.decl.is_definition = true;
                     if (check(p, TK_ASSIGN)) {
                         parser_advance(p);
-                        if (check(p, TK_LBRACE)) {
-                            parser_error(p, p->cur.loc,
-                                         "brace initializers are not supported yet");
-                            skip_balanced(p, TK_LBRACE, TK_RBRACE);
-                        } else {
-                            dn->u.decl.init = parse_assignment(p);
-                        }
+                        dn->u.decl.init = parse_initializer(p);
                     }
                     append_node(&head, &tail, dn);
                 } else {
@@ -1229,6 +1457,8 @@ static EtccAstNode *parse_compound(EtccParser *p) {
 
     expect(p, TK_RBRACE, "'}'");
     p->typedefs.len = typedef_mark;
+    p->tags.len = tag_mark;
+    p->tag_depth = old_tag_depth;
 
     EtccAstNode *n = etcc_ast_new(p->arena, AST_COMPOUND, loc);
     n->u.compound.stmts = head;
@@ -1259,13 +1489,7 @@ static EtccAstNode *parse_global_declaration(EtccParser *p, DeclSpec *ds,
                 ds->storage != STORAGE_EXTERN;
             if (check(p, TK_ASSIGN)) {
                 parser_advance(p);
-                if (check(p, TK_LBRACE)) {
-                    parser_error(p, p->cur.loc,
-                                 "brace initializers are not supported yet");
-                    skip_balanced(p, TK_LBRACE, TK_RBRACE);
-                } else {
-                    n->u.decl.init = parse_assignment(p);
-                }
+                n->u.decl.init = parse_initializer(p);
             }
             append_node(&head, &tail, n);
         } else {
@@ -1352,5 +1576,6 @@ EtccAstNode *etcc_parse_translation_unit(EtccArena *arena,
 
     tu->u.tu.decls = head;
     free(p.typedefs.items);
+    free(p.tags.items);
     return tu;
 }

@@ -20,6 +20,7 @@ typedef enum IrTypeKind {
     IR_TYPE_I64,
     IR_TYPE_PTR,
     IR_TYPE_ARRAY,
+    IR_TYPE_STRUCT,
 } IrTypeKind;
 
 typedef struct IrType IrType;
@@ -181,12 +182,13 @@ struct IrGlobal {
     bool is_internal;
     bool is_external;
     bool is_string;
-    const char *init_data; /* string bytes, including trailing NUL */
+    const char *init_data; /* string/byte initializer */
     size_t init_len;
     bool has_int_init;
     uint64_t init_int;
     bool has_ptr_init;
     IrGlobal *ptr_init;
+    bool has_bytes_init;
     IrGlobal *next;
 };
 
@@ -226,6 +228,7 @@ IrType *ir_type_i32(IrModule *m);
 IrType *ir_type_i64(IrModule *m);
 IrType *ir_type_ptr(IrModule *m, IrType *elem);
 IrType *ir_type_array(IrModule *m, IrType *elem, uint64_t count);
+IrType *ir_type_struct(IrModule *m, size_t size, size_t align);
 
 IrValue *ir_const_int(IrModule *m, IrType *type, uint64_t value);
 IrValue *ir_const_null(IrModule *m, IrType *pointer_type);
@@ -250,7 +253,8 @@ void ir_block_set_cond_br(IrModule *m, IrBlock *b, IrValue *cond,
                           IrBlock *then_block, IrBlock *else_block);
 
 IrValue *ir_build_alloca(IrModule *m, IrFunction *fn, IrType *type);
-IrValue *ir_build_load(IrModule *m, IrBlock *b, IrValue *ptr);
+IrValue *ir_build_load(IrModule *m, IrBlock *b, IrValue *ptr,
+                       IrType *type);
 void ir_build_store(IrModule *m, IrBlock *b, IrValue *ptr, IrValue *value);
 IrValue *ir_build_gep(IrModule *m, IrBlock *b, IrValue *ptr, IrType *elem,
                       IrValue *index);

@@ -73,6 +73,77 @@ EtccCType *etcc_type_func(EtccArena *a, EtccCType *result, EtccCType **params,
     return t;
 }
 
+EtccCType *etcc_type_struct(EtccArena *a, EtccCTypeKind kind,
+                            const char *tag) {
+    EtccCType *t = etcc_arena_alloc(a, sizeof(*t), _Alignof(EtccCType));
+    *t = (EtccCType){
+        .kind = kind,
+        .size = 0,
+        .align = 1,
+        .tag = tag ? etcc_arena_strdup(a, tag) : NULL,
+        .is_complete = false,
+        .identity = t,
+    };
+    return t;
+}
+
+EtccField *etcc_field_new(EtccArena *a, const char *name, EtccCType *type) {
+    EtccField *f = etcc_arena_alloc(a, sizeof(*f), _Alignof(EtccField));
+    memset(f, 0, sizeof(*f));
+    f->name = etcc_arena_strdup(a, name);
+    f->type = type;
+    return f;
+}
+
+static size_t align_up(size_t value, size_t align) {
+    if (align <= 1) return value;
+    return (value + align - 1) & ~(align - 1);
+}
+
+bool etcc_type_define(EtccArena *a, EtccCType *t, EtccField *fields) {
+    (void)a;
+    if (!t || (t->kind != CT_STRUCT && t->kind != CT_UNION)) return false;
+    bool is_union = t->kind == CT_UNION;
+
+    size_t size = 0;
+    size_t align = 1;
+    for (EtccField *f = fields; f; f = f->next) {
+        if (!f->type) return false;
+        if (f->type->kind == CT_VOID || f->type->kind == CT_FUNC) return false;
+        if (f->type->kind == CT_ARRAY && f->type->array_len == 0) return false;
+        if ((f->type->kind == CT_STRUCT || f->type->kind == CT_UNION) &&
+            !f->type->is_complete)
+            return false;
+
+        size_t fa = f->type->align ? f->type->align : 1;
+        if (fa > align) align = fa;
+        if (is_union) {
+            f->offset = 0;
+            if (f->type->size > size) size = f->type->size;
+        } else {
+            size = align_up(size, fa);
+            f->offset = size;
+            size += f->type->size;
+        }
+    }
+
+    t->fields = fields;
+    t->size = align_up(size, align);
+    t->align = align;
+    t->is_complete = true;
+    return true;
+}
+
+EtccField *etcc_type_find_field(const EtccCType *t, const char *name,
+                                size_t name_len) {
+    if (!t || (t->kind != CT_STRUCT && t->kind != CT_UNION)) return NULL;
+    for (EtccField *f = t->fields; f; f = f->next) {
+        size_t n = strlen(f->name);
+        if (n == name_len && memcmp(f->name, name, n) == 0) return f;
+    }
+    return NULL;
+}
+
 bool etcc_type_equal(const EtccCType *a, const EtccCType *b) {
     if (a == b) return true;
     if (!a || !b) return false;
@@ -88,6 +159,9 @@ bool etcc_type_equal(const EtccCType *a, const EtccCType *b) {
         for (size_t i = 0; i < a->nparams; i++)
             if (!etcc_type_equal(a->params[i], b->params[i])) return false;
         return true;
+    case CT_STRUCT:
+    case CT_UNION:
+        return a->identity == b->identity;
     default:
         return a->is_unsigned == b->is_unsigned;
     }
@@ -115,6 +189,10 @@ bool etcc_type_is_arithmetic(const EtccCType *t) {
 
 bool etcc_type_is_pointer(const EtccCType *t) {
     return t && t->kind == CT_PTR;
+}
+
+bool etcc_type_is_aggregate(const EtccCType *t) {
+    return t && (t->kind == CT_STRUCT || t->kind == CT_UNION);
 }
 
 bool etcc_type_is_scalar(const EtccCType *t) {
@@ -168,15 +246,15 @@ EtccCType *etcc_type_common_arithmetic(EtccCType *a, EtccCType *b) {
     /* Signed type cannot represent the unsigned range: use its unsigned form. */
     static EtccCType unsigned_versions[CT_LLONG + 1];
     unsigned_versions[CT_CHAR] =
-        (EtccCType){CT_CHAR, 1, 1, true, false, NULL, 0, NULL, 0, false};
+        (EtccCType){.kind = CT_CHAR, .size = 1, .align = 1, .is_unsigned = true};
     unsigned_versions[CT_SHORT] =
-        (EtccCType){CT_SHORT, 2, 2, true, false, NULL, 0, NULL, 0, false};
+        (EtccCType){.kind = CT_SHORT, .size = 2, .align = 2, .is_unsigned = true};
     unsigned_versions[CT_INT] =
-        (EtccCType){CT_INT, 4, 4, true, false, NULL, 0, NULL, 0, false};
+        (EtccCType){.kind = CT_INT, .size = 4, .align = 4, .is_unsigned = true};
     unsigned_versions[CT_LONG] =
-        (EtccCType){CT_LONG, 4, 4, true, false, NULL, 0, NULL, 0, false};
+        (EtccCType){.kind = CT_LONG, .size = 4, .align = 4, .is_unsigned = true};
     unsigned_versions[CT_LLONG] =
-        (EtccCType){CT_LLONG, 8, 8, true, false, NULL, 0, NULL, 0, false};
+        (EtccCType){.kind = CT_LLONG, .size = 8, .align = 8, .is_unsigned = true};
     return &unsigned_versions[s->kind];
 }
 
@@ -214,6 +292,13 @@ const char *etcc_type_format(const EtccCType *t, char *buf, size_t size) {
         etcc_type_format(t->base, inner, sizeof(inner));
         snprintf(buf, size, "%s[%llu]", inner,
                  (unsigned long long)t->array_len);
+        break;
+    }
+    case CT_STRUCT:
+    case CT_UNION: {
+        const char *kw = t->kind == CT_UNION ? "union" : "struct";
+        if (t->tag) snprintf(buf, size, "%s %s", kw, t->tag);
+        else snprintf(buf, size, "%s <anonymous>", kw);
         break;
     }
     case CT_FUNC: {

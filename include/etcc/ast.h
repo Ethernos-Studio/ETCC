@@ -32,6 +32,7 @@ typedef enum EtccAstKind {
     AST_CONTINUE,
     AST_EXPR_STMT,
     AST_EMPTY,
+    AST_INIT_LIST,
 
     AST_INT_LIT,
     AST_CHAR_LIT,
@@ -117,6 +118,10 @@ struct EtccAstNode {
         struct {
             EtccAstNode *expr;
         } expr_stmt;
+
+        struct {
+            EtccAstNode *items;
+        } init_list;
 
         struct {
             uint64_t value;

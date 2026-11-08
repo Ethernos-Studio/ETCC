@@ -1,6 +1,6 @@
 # ETCC 后端开发指南
 
-ETCC 的核心设计目标之一是：**换后端不碰前端**。本文说明后端接口、Hello World 的 IR 形态、链接契约，以及新增后端的最小步骤。
+ETCC 的核心设计目标之一是：**换后端不碰前端**。本文说明后端接口、Hello World 的 IR 形态、聚合类型的 IR 表示、链接契约，以及新增后端的最小步骤。
 
 ## 1. 后端接口
 
@@ -98,6 +98,36 @@ entry:
 - 入口 block：`GEP` 把“指向数组的指针”衰减为“指向首字符的指针”；
 - `CALL`：直接调用 `puts`；
 - `RET`：`i32 0`。
+
+## 3.1 聚合类型在 IR 中的样子
+
+`struct` / `union` 不在 IR 中保留字段表：
+
+```c
+IR_TYPE_STRUCT { size, align }
+```
+
+LLVM 后端把它输出为 `[size x i8]`。例如：
+
+```llvm
+%p = alloca [8 x i8], align 4
+%x = getelementptr inbounds i8, ptr %p, i64 0
+store i32 3, ptr %x, align 4
+%y = getelementptr inbounds i8, ptr %p, i64 4
+store i32 4, ptr %y, align 4
+%whole = load [8 x i8], ptr %p, align 4
+```
+
+约定：
+
+- 字段偏移由前端算好，后端只做 **字节 GEP**；
+- `LOAD` 的结果类型显式给出（不能从字节指针推断）；
+- `STORE` 的类型由值决定；
+- 聚合整体赋值是 `load [N x i8]` + `store [N x i8]`；
+- 全局聚合初始化是 `[N x i8] c"..."` 静态字节镜像，成员访问仍按真实字段类型 GEP/load；
+- 后端不需要实现 C 的布局算法，也不要假设 `[N x i8]` 的对齐等于 1（必须使用 IR 的 align）。
+
+如果新后端直接生成机器码，也应该把聚合对象视为“带大小/对齐的连续字节”，并遵守上述 load/store/GEP 类型。
 
 ## 4. 链接契约
 
@@ -201,8 +231,9 @@ etcc --backend native tests\hello.c -o build\hello.exe
 - [ ] `IrFunction`：声明/定义、internal、参数、变参；
 - [ ] `IrBlock`：顺序、终止符；
 - [ ] `ALLOCA`：类型、对齐；
-- [ ] `LOAD/STORE`：类型与对齐；
-- [ ] `GEP`：元素类型、索引类型、指针衰减；
+- [ ] `LOAD/STORE`：显式结果类型、对齐、聚合按字节复制；
+- [ ] `GEP`：数组元素缩放、`i8` 字节偏移、指针衰减；
+- [ ] 聚合类型：`IR_TYPE_STRUCT` 的 size/align，不要重新实现 C 字段布局；
 - [ ] `BIN`：有符号/无符号除法、余数、算术右移/逻辑右移；
 - [ ] `CMP`：有符号/无符号比较，结果为 C 的 `int` 0/1；
 - [ ] `CAST`：trunc/zext/sext/ptrtoint/inttoptr；
@@ -229,7 +260,9 @@ mingw32-make test
 ## 8. 常见坑
 
 - **不要把 IR 指针当作 LLVM typed pointer**：IR 的 `elem` 只用于语义/GEP，LLVM 输出必须是 `ptr`。
+- **不要根据指针类型推断 LOAD 类型**：字节 GEP 后的指针可能是 `i8*`，但实际字段可能是 `i32`/`ptr`/聚合；必须使用指令的显式结果类型。
 - **不要假设 C 的 `int` 是 64 位**：Windows LLP64 下 `long` 是 32 位。
+- **不要忽略全局聚合的字节镜像**：`has_bytes_init` 的全局对象定义类型是 `[N x i8]`，但成员访问可能使用任意字段类型；opaque pointer 下这是合法的。
 - **不要在 `CMP` 后端直接返回 `i1`**：IR 结果是 `i32`，要 `zext` 或直接生成 0/1。
 - **不要忽略 `IR_TERM_NONE`**：`ir_validate` 会报错；新后端也应拒绝未终止 block。
 - **不要从后端调用前端**：后端只消费 IR；需要额外信息时扩展 IR，而不是反向依赖 AST。

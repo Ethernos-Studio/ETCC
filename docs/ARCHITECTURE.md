@@ -1,6 +1,6 @@
 # ETCC 架构说明
 
-本文描述 ETCC 0.1 的模块边界、数据流、IR 契约和后端扩展方式。
+本文描述 ETCC 0.2 的模块边界、数据流、IR 契约和后端扩展方式。
 
 ## 1. 总览
 
@@ -57,7 +57,9 @@
 - 声明说明符（存储类、限定符、基础类型）与声明符（指针、数组、函数参数）。
 - 表达式优先级：赋值 → 条件 → `||` → `&&` → 位或 → 异或 → 位与 → 相等 → 关系 → 移位 → 加减 → 乘除 → cast → unary → postfix → primary。
 - 语句：复合、`if`、`while`、`do`、`for`、`break`、`continue`、`return`。
-- 解析期维护 typedef 名称表，用于消解 `(T)x` 与 `(expr)`，以及块内声明/语句歧义。
+- 解析期维护 typedef 名称表和 tag 名称表（struct/union，按作用域深度）；
+- `struct` / `union` 定义、字段声明、前置声明、自引用指针、匿名聚合；
+- 初始化器递归解析为 `AST_INIT_LIST`，支持嵌套、尾随逗号；
 - 错误恢复：语句级同步到 `;` / `}`；顶层同步到声明起点；错误过多时停止。
 - AST 节点、名称、字符串全部落在 arena 中。
 
@@ -74,11 +76,20 @@
 - 建立全局符号表（函数、全局变量），再分析函数体；
 - 局部作用域、块作用域、`for` 作用域；
 - 整数提升、常用算术转换、指针算术、赋值兼容性；
+- `struct` / `union` 类型完整性、字段查找、Windows x64 布局（偏移/填充/大小/对齐）；
 - 生成 typed IR：alloca/load/store/gep/bin/cmp/cast/call；
 - 控制流 lowering：`if`、`while`、`do`、`for`、`&&`/`||` 短路、`?:` 都转换为基本块；
 - 变量声明统一在函数 entry block 分配栈槽，避免循环内重复 alloca；
+- 聚合初始化：局部对象按字段/元素递归写入并补零；全局对象在编译期生成字节镜像；
 - 生成字符串全局对象、全局变量初始化器；
 - 调用 `ir_validate()` 检查每个 block 是否终止。
+
+聚合类型的关键约定：
+
+- `struct` / `union` 的字段偏移由 `ctype.c` 的布局算法一次算好；
+- sema 对成员访问统一生成 **字节偏移 GEP**（`getelementptr i8, ptr base, i64 offset`），因此后端不需要理解 C 字段；
+- 聚合整体赋值生成 `load <struct> / store <struct>`；
+- 聚合按值传参/返回尚未实现，会给出明确诊断；指针传参完全支持。
 
 ### 2.5 Backend (`backend.c`, `backend_llvm.c`)
 
@@ -123,8 +134,9 @@ LLVM 后端的职责非常窄：
 ```c
 IR_TYPE_VOID
 IR_TYPE_I8 / I16 / I32 / I64
-IR_TYPE_PTR     // 带 pointee 信息，LLVM 输出为 opaque ptr
+IR_TYPE_PTR       // 带 pointee 信息，LLVM 输出为 opaque ptr
 IR_TYPE_ARRAY
+IR_TYPE_STRUCT    // 只携带 size/align；LLVM 输出为 [size x i8]
 ```
 
 IR 指针保留 `elem` 是为了：
@@ -132,6 +144,14 @@ IR 指针保留 `elem` 是为了：
 - 前端/GEP 表达元素类型；
 - 未来 native 后端计算步长；
 - LLVM 后端仍统一输出 `ptr`，不依赖 typed pointer。
+
+`IR_TYPE_STRUCT` 不携带字段列表。C 的字段偏移在 sema/ctype 中已经解析为字节偏移，IR 只需知道对象大小和对齐。这样：
+
+- LLVM 后端把结构体当作 `[N x i8]`，天然支持任意布局、联合体和填充；
+- 成员访问是字节 GEP + 显式类型的 load/store；
+- 新后端不需要复制 C 的字段布局算法。
+
+`LOAD` 指令显式携带结果类型（`ir_build_load(..., type)`），因为字节 GEP 得到的指针 IR 类型可能是 `i8*`，而实际读取的字段可能是 `i32`/`ptr`/结构体。
 
 ### 3.2 值
 
@@ -151,11 +171,13 @@ IR 指针保留 `elem` 是为了：
 | `ALLOCA` | 栈槽 | `alloca` |
 | `LOAD` | 读取 | `load` |
 | `STORE` | 写入 | `store` |
-| `GEP` | 指针/数组下标 | `getelementptr` |
+| `GEP` | 指针/数组下标/结构体字节偏移 | `getelementptr` |
 | `BIN` | 整数二元运算 | `add/sub/mul/sdiv/...` |
 | `CMP` | 比较并产生 C 的 `int` 0/1 | `icmp` + `zext` |
 | `CAST` | 截断/扩展/指针转换 | `trunc/zext/sext/ptrtoint/inttoptr` |
 | `CALL` | 直接函数调用 | `call` |
+
+`LOAD`/`STORE` 的聚合类型在 LLVM 中表现为 `[N x i8]`；`GEP` 既可以按数组元素类型缩放，也可以用 `i8` 做字节偏移。聚合初始化在 sema 中已经被拆成语义明确的逐字段/逐元素存储，因此 IR 不需要“初始化器”指令。
 
 `CMP` 在 IR 层直接产生 `i32` 的 0/1，而不是 `i1`。这样 C 语义（比较结果是 `int`）在前端就固定下来，后端不需要知道 C 的布尔表示。LLVM 后端用两条 LLVM 指令实现。
 
@@ -169,10 +191,12 @@ IR 指针保留 `elem` 是为了：
 
 ### 3.5 全局对象与函数
 
-- `IrGlobal`：名字、类型、是否 internal/external/const、字符串初始化数据、整数或指针初始化器；
+- `IrGlobal`：名字、类型、是否 internal/external/const、字符串/字节初始化数据、整数或指针初始化器；
 - `IrFunction`：返回类型、参数类型数组、是否变参、是否定义、参数值、基本块链表；
 - 函数声明与定义共用同一个 `IrFunction`，`is_definition` 区分；
-- 字符串字面量生成 private unnamed_addr constant。
+- 字符串字面量生成 private unnamed_addr constant；
+- 全局聚合初始化生成静态字节镜像，LLVM 声明为 `[N x i8]` + `c"..."`，成员/元素访问仍按真实 C 类型做 GEP/load；
+- 非空指针重定位（聚合里的 `char *p = "x"`）尚未支持，避免把地址写死进字节数据。
 
 ## 4. 运行时与 ABI
 
@@ -240,8 +264,10 @@ __declspec(noreturn) void etcc_entry(void) {
 1. 语义分析与 IR 生成在同一遍，未来可拆为 typed AST/HIR + IRGen。
 2. 预处理器是行级的，函数式宏、`#`/`##`、跨行宏续行尚未实现。
 3. `-E` 不展开对象宏（对象宏在 lexer 阶段才展开）。
-4. typedef 名称仅由 parser 维护，语义阶段没有独立的 tag/typedef 命名空间。
+4. typedef/tag 名称仅由 parser 维护，语义阶段没有独立的 tag/typedef 命名空间。
 5. 全局 tentative definition 的重复声明规则还不完整。
 6. 临时文件放在当前工作目录，若在只读目录运行需要显式指定可写目录（后续可加 `TMPDIR`/输出目录策略）。
+7. 聚合按值传参/返回、位域、指定初始化器、flexible array member 尚未实现。
+8. 全局聚合初始化暂不支持非空指针重定位。
 
 这些债不会阻碍新增后端：后端只消费 IR，不依赖前端内部结构。

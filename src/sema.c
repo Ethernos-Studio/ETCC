@@ -62,6 +62,8 @@ static bool sema_expr(EtccSema *s, EtccAstNode *n, SemVal *out);
 static bool sema_lvalue(EtccSema *s, EtccAstNode *n, SemVal *out);
 static bool sema_stmt(EtccSema *s, EtccAstNode *n);
 static EtccCType *infer_type(EtccSema *s, EtccAstNode *n);
+static IrType *map_type(EtccSema *s, EtccCType *t, EtccLoc loc);
+static bool type_is_complete_object(const EtccCType *t);
 
 static void sema_error(EtccSema *s, EtccLoc loc, const char *fmt, ...) {
     va_list ap;
@@ -83,12 +85,18 @@ static void sema_warning(EtccSema *s, EtccLoc loc, const char *fmt, ...) {
 }
 
 static EtccCType *ctype_size_t(void) {
-    static EtccCType t = {CT_LLONG, 8, 8, true, false, NULL, 0, NULL, 0, false};
+    static EtccCType t = {.kind = CT_LLONG,
+                          .size = 8,
+                          .align = 8,
+                          .is_unsigned = true};
     return &t;
 }
 
 static EtccCType *ctype_uint(void) {
-    static EtccCType t = {CT_INT, 4, 4, true, false, NULL, 0, NULL, 0, false};
+    static EtccCType t = {.kind = CT_INT,
+                          .size = 4,
+                          .align = 4,
+                          .is_unsigned = true};
     return &t;
 }
 
@@ -126,6 +134,18 @@ static bool is_void(const EtccCType *t) {
     return t && t->kind == CT_VOID;
 }
 
+static bool is_aggregate(const EtccCType *t) {
+    return etcc_type_is_aggregate(t);
+}
+
+static IrType *map_type_allow_incomplete(EtccSema *s, EtccCType *t,
+                                         EtccLoc loc) {
+    if (!t) return ir_type_i32(s->m);
+    if ((t->kind == CT_STRUCT || t->kind == CT_UNION) && !t->is_complete)
+        return ir_type_struct(s->m, 0, 1);
+    return map_type(s, t, loc);
+}
+
 static IrType *map_type(EtccSema *s, EtccCType *t, EtccLoc loc) {
     if (!t) return ir_type_i32(s->m);
     switch (t->kind) {
@@ -141,7 +161,7 @@ static IrType *map_type(EtccSema *s, EtccCType *t, EtccLoc loc) {
         sema_error(s, loc, "floating-point types are not supported yet");
         return ir_type_i32(s->m);
     case CT_PTR:
-        return ir_type_ptr(s->m, map_type(s, t->base, loc));
+        return ir_type_ptr(s->m, map_type_allow_incomplete(s, t->base, loc));
     case CT_ARRAY: {
         uint64_t count = t->array_len;
         if (count == 0) {
@@ -150,6 +170,14 @@ static IrType *map_type(EtccSema *s, EtccCType *t, EtccLoc loc) {
         }
         return ir_type_array(s->m, map_type(s, t->base, loc), count);
     }
+    case CT_STRUCT:
+    case CT_UNION:
+        if (!t->is_complete || t->size == 0) {
+            sema_error(s, loc, "incomplete %s type is not allowed here",
+                       t->kind == CT_UNION ? "union" : "struct");
+            return ir_type_struct(s->m, 1, 1);
+        }
+        return ir_type_struct(s->m, t->size, t->align);
     case CT_FUNC:
         return ir_type_ptr(s->m, ir_type_void(s->m));
     default:
@@ -270,6 +298,11 @@ static IrValue *convert_value(EtccSema *s, IrValue *v, EtccCType *from,
     if (!from) from = to;
     if (etcc_type_equal(from, to)) return v;
 
+    if (is_aggregate(to) || is_aggregate(from)) {
+        sema_error(s, loc, "incompatible aggregate types in conversion");
+        return v;
+    }
+
     if (to->kind == CT_FLOAT || to->kind == CT_DOUBLE ||
         from->kind == CT_FLOAT || from->kind == CT_DOUBLE) {
         sema_error(s, loc, "floating-point conversions are not supported yet");
@@ -325,7 +358,15 @@ static IrValue *convert_value(EtccSema *s, IrValue *v, EtccCType *from,
 
 static void load_lvalue(EtccSema *s, SemVal *v) {
     if (v->addr && v->type->kind != CT_ARRAY && v->type->kind != CT_FUNC)
-        v->value = ir_build_load(s->m, s->cur, v->addr);
+        v->value = ir_build_load(s->m, s->cur, v->addr,
+                                 map_type(s, v->type, ETCC_LOC_NONE));
+}
+
+static IrValue *byte_offset_ptr(EtccSema *s, IrValue *base, size_t offset) {
+    if (!base) return NULL;
+    if (offset == 0) return base;
+    IrValue *idx = ir_const_int(s->m, ir_type_i64(s->m), (uint64_t)offset);
+    return ir_build_gep(s->m, s->cur, base, ir_type_i8(s->m), idx);
 }
 
 static bool sema_lvalue(EtccSema *s, EtccAstNode *n, SemVal *out) {
@@ -388,9 +429,44 @@ static bool sema_lvalue(EtccSema *s, EtccAstNode *n, SemVal *out) {
         out->value = out->addr;
         return true;
     }
-    case AST_MEMBER:
-        sema_error(s, n->loc, "struct/union members are not supported yet");
-        return false;
+    case AST_MEMBER: {
+        SemVal base;
+        EtccCType *st = NULL;
+        IrValue *base_addr = NULL;
+        if (n->u.member.arrow) {
+            if (!sema_expr(s, n->u.member.base, &base)) return false;
+            if (!decay(s, &base, n->loc)) return false;
+            if (!is_pointer(base.type)) {
+                sema_error(s, n->loc, "'->' requires a pointer to struct/union");
+                return false;
+            }
+            st = base.type->base;
+            base_addr = base.value;
+        } else {
+            if (!sema_lvalue(s, n->u.member.base, &base)) return false;
+            st = base.type;
+            base_addr = base.addr;
+        }
+        if (!is_aggregate(st)) {
+            sema_error(s, n->loc, "member access requires a struct or union");
+            return false;
+        }
+        if (!st->is_complete) {
+            sema_error(s, n->loc, "member access on an incomplete type");
+            return false;
+        }
+        EtccField *f = etcc_type_find_field(st, n->u.member.field,
+                                            n->u.member.field_len);
+        if (!f) {
+            sema_error(s, n->loc, "no member named '%.*s'",
+                       (int)n->u.member.field_len, n->u.member.field);
+            return false;
+        }
+        out->type = f->type;
+        out->addr = byte_offset_ptr(s, base_addr, f->offset);
+        out->value = out->addr;
+        return true;
+    }
     default:
         sema_error(s, n->loc, "expression is not assignable");
         return false;
@@ -433,6 +509,11 @@ static bool sema_call(EtccSema *s, EtccAstNode *n, SemVal *out) {
         sema_error(s, n->loc, "'%s' is not a function", name);
         return false;
     }
+    if (is_aggregate(ft->base)) {
+        sema_error(s, n->loc,
+                   "returning struct/union by value is not supported yet");
+        return false;
+    }
 
     size_t nargs = 0;
     for (EtccAstNode *a = n->u.call.args; a; a = a->next) nargs++;
@@ -456,10 +537,20 @@ static bool sema_call(EtccSema *s, EtccAstNode *n, SemVal *out) {
         if (!decay(s, &av, a->loc)) return false;
         if (i < ft->nparams) {
             EtccCType *pt = ft->params[i];
+            if (is_aggregate(pt) || is_aggregate(av.type)) {
+                sema_error(s, a->loc,
+                           "passing struct/union by value is not supported yet");
+                return false;
+            }
             av.value = convert_value(s, av.value, av.type, pt, a->loc, false);
             av.type = pt;
             args[i] = av.value;
         } else {
+            if (is_aggregate(av.type)) {
+                sema_error(s, a->loc,
+                           "passing struct/union by value is not supported yet");
+                return false;
+            }
             if (av.type->kind == CT_FLOAT || av.type->kind == CT_DOUBLE) {
                 sema_error(s, a->loc,
                            "floating-point varargs are not supported yet");
@@ -516,7 +607,7 @@ static bool sema_short_circuit(EtccSema *s, EtccAstNode *n, SemVal *out,
 
     s->cur = end;
     out->type = etcc_type_builtin(CT_INT);
-    out->value = ir_build_load(s->m, s->cur, slot);
+    out->value = ir_build_load(s->m, s->cur, slot, ir_type_i32(s->m));
     out->addr = NULL;
     return true;
 }
@@ -700,6 +791,25 @@ static bool sema_assign(EtccSema *s, EtccAstNode *n, SemVal *out) {
     }
 
     EtccTokenKind op = n->u.assign.op;
+    if (is_aggregate(target.type)) {
+        if (op != TK_ASSIGN) {
+            sema_error(s, n->loc,
+                       "compound assignment is not valid for struct/union");
+            return false;
+        }
+        SemVal rhs;
+        if (!sema_expr(s, n->u.assign.value, &rhs)) return false;
+        if (!decay(s, &rhs, n->loc)) return false;
+        if (!etcc_type_equal(rhs.type, target.type)) {
+            sema_error(s, n->loc, "incompatible struct/union assignment");
+            return false;
+        }
+        ir_build_store(s->m, s->cur, target.addr, rhs.value);
+        out->type = target.type;
+        out->value = rhs.value;
+        out->addr = NULL;
+        return true;
+    }
     if (op == TK_ASSIGN) {
         SemVal rhs;
         if (!sema_expr(s, n->u.assign.value, &rhs)) return false;
@@ -786,7 +896,8 @@ static bool sema_incdec(EtccSema *s, EtccAstNode *n, SemVal *out) {
     if (!sema_lvalue(s, n->u.unary.operand, &target)) return false;
     bool inc = n->u.unary.op == TK_PLUS_PLUS;
     if (is_pointer(target.type)) {
-        IrValue *old = ir_build_load(s->m, s->cur, target.addr);
+        IrValue *old = ir_build_load(s->m, s->cur, target.addr,
+                                     map_type(s, target.type, n->loc));
         IrValue *one = ir_const_int(s->m, ir_type_i64(s->m), 1);
         if (!inc) {
             IrValue *zero = ir_const_int(s->m, ir_type_i64(s->m), 0);
@@ -805,7 +916,8 @@ static bool sema_incdec(EtccSema *s, EtccAstNode *n, SemVal *out) {
         return false;
     }
     EtccCType *ct = integer_promote(s, target.type);
-    IrValue *old = ir_build_load(s->m, s->cur, target.addr);
+    IrValue *old = ir_build_load(s->m, s->cur, target.addr,
+                                 map_type(s, target.type, n->loc));
     old = convert_value(s, old, target.type, ct, n->loc, false);
     IrValue *one = ir_const_int(s->m, map_type(s, ct, n->loc), 1);
     IrValue *nv = ir_build_bin(s->m, s->cur, inc ? IR_BIN_ADD : IR_BIN_SUB,
@@ -870,7 +982,7 @@ static bool sema_cond_expr(EtccSema *s, EtccAstNode *n, SemVal *out) {
 
     s->cur = end;
     out->type = rt;
-    out->value = ir_build_load(s->m, s->cur, slot);
+    out->value = ir_build_load(s->m, s->cur, slot, rt_ir);
     out->addr = NULL;
     return true;
 }
@@ -889,20 +1001,22 @@ static bool sema_expr(EtccSema *s, EtccAstNode *n, SemVal *out) {
         uint64_t v = n->u.int_lit.value;
         EtccCType *t;
         if (n->u.int_lit.is_unsigned) {
-            if (v <= 0xFFFFFFFFull && !n->u.int_lit.is_unsigned)
+            if (v <= 0xFFFFFFFFull) {
                 t = ctype_uint();
-            else if (v <= 0xFFFFFFFFull)
-                t = ctype_uint();
-            else {
-                static EtccCType ull = {CT_LLONG, 8, 8, true, false, NULL, 0,
-                                        NULL, 0, false};
+            } else {
+                static EtccCType ull = {.kind = CT_LLONG,
+                                        .size = 8,
+                                        .align = 8,
+                                        .is_unsigned = true};
                 t = &ull;
             }
         } else if (v <= 0x7FFFFFFFull) {
             t = etcc_type_builtin(CT_INT);
         } else if (v <= 0xFFFFFFFFull) {
-            static EtccCType ul = {CT_LONG, 4, 4, true, false, NULL, 0, NULL,
-                                   0, false};
+            static EtccCType ul = {.kind = CT_LONG,
+                                   .size = 4,
+                                   .align = 4,
+                                   .is_unsigned = true};
             t = &ul;
         } else {
             t = etcc_type_builtin(CT_LLONG);
@@ -1026,7 +1140,8 @@ static bool sema_expr(EtccSema *s, EtccAstNode *n, SemVal *out) {
         if (!sema_expr(s, n->u.cast.operand, &v)) return false;
         if (!decay(s, &v, n->loc)) return false;
         EtccCType *target = n->u.cast.target;
-        if (target->kind == CT_ARRAY || target->kind == CT_FUNC) {
+        if (target->kind == CT_ARRAY || target->kind == CT_FUNC ||
+            is_aggregate(target)) {
             sema_error(s, n->loc, "cast target must be a scalar type");
             return false;
         }
@@ -1043,8 +1158,7 @@ static bool sema_expr(EtccSema *s, EtccAstNode *n, SemVal *out) {
             sema_error(s, n->loc, "cannot determine the size of this expression");
             return false;
         }
-        if (t->kind == CT_VOID || t->kind == CT_FUNC ||
-            (t->kind == CT_ARRAY && t->array_len == 0)) {
+        if (!type_is_complete_object(t)) {
             sema_error(s, n->loc, "sizeof applied to an incomplete type");
             return false;
         }
@@ -1057,9 +1171,14 @@ static bool sema_expr(EtccSema *s, EtccAstNode *n, SemVal *out) {
         if (!sema_expr(s, n->u.comma.lhs, &a)) return false;
         return sema_expr(s, n->u.comma.rhs, out);
     }
-    case AST_MEMBER:
-        sema_error(s, n->loc, "struct/union members are not supported yet");
-        return false;
+    case AST_MEMBER: {
+        SemVal t;
+        if (!sema_lvalue(s, n, &t)) return false;
+        load_lvalue(s, &t);
+        if (!decay(s, &t, n->loc)) return false;
+        *out = t;
+        return true;
+    }
     default:
         sema_error(s, n->loc, "unsupported expression (%s)",
                    etcc_ast_kind_name(n->kind));
@@ -1072,7 +1191,10 @@ static EtccCType *infer_type(EtccSema *s, EtccAstNode *n) {
     switch (n->kind) {
     case AST_INT_LIT:
         if (n->u.int_lit.is_unsigned) {
-            static EtccCType u = {CT_INT, 4, 4, true, false, NULL, 0, NULL, 0, false};
+            static EtccCType u = {.kind = CT_INT,
+                                  .size = 4,
+                                  .align = 4,
+                                  .is_unsigned = true};
             return &u;
         }
         return etcc_type_builtin(CT_INT);
@@ -1135,6 +1257,17 @@ static EtccCType *infer_type(EtccSema *s, EtccAstNode *n) {
     }
     case AST_SIZEOF:
         return ctype_size_t();
+    case AST_MEMBER: {
+        EtccCType *bt = infer_type(s, n->u.member.base);
+        if (n->u.member.arrow) {
+            if (!bt || bt->kind != CT_PTR) return NULL;
+            bt = bt->base;
+        }
+        if (!is_aggregate(bt) || !bt->is_complete) return NULL;
+        EtccField *f = etcc_type_find_field(bt, n->u.member.field,
+                                            n->u.member.field_len);
+        return f ? f->type : NULL;
+    }
     case AST_COMMA:
         return infer_type(s, n->u.comma.rhs);
     default:
@@ -1143,6 +1276,194 @@ static EtccCType *infer_type(EtccSema *s, EtccAstNode *n) {
 }
 
 static bool sema_decl_list(EtccSema *s, EtccAstNode *decls, bool global);
+
+static bool is_char_type(const EtccCType *t) {
+    return t && t->kind == CT_CHAR;
+}
+
+static size_t count_init_items(const EtccAstNode *init) {
+    size_t n = 0;
+    for (const EtccAstNode *it = init ? init->u.init_list.items : NULL; it;
+         it = it->next)
+        n++;
+    return n;
+}
+
+static bool type_is_complete_object(const EtccCType *t) {
+    if (!t) return false;
+    switch (t->kind) {
+    case CT_VOID:
+    case CT_FUNC:
+        return false;
+    case CT_ARRAY:
+        return t->array_len > 0 && type_is_complete_object(t->base);
+    case CT_STRUCT:
+    case CT_UNION:
+        return t->is_complete;
+    default:
+        return true;
+    }
+}
+
+static EtccCType *complete_array_type(EtccSema *s, EtccCType *t,
+                                      EtccAstNode *init, EtccLoc loc) {
+    if (!t || t->kind != CT_ARRAY || t->array_len != 0) return t;
+
+    uint64_t len = 0;
+    if (init && init->kind == AST_STRING_LIT && is_char_type(t->base)) {
+        len = (uint64_t)init->u.string_lit.len + 1;
+    } else if (init && init->kind == AST_INIT_LIST) {
+        len = (uint64_t)count_init_items(init);
+    } else {
+        sema_error(s, loc,
+                   "array with unspecified size requires a brace or string initializer");
+        len = 1;
+    }
+    if (len == 0) {
+        sema_error(s, loc, "array initializer must not be empty");
+        len = 1;
+    }
+    if (len > SIZE_MAX / (etcc_type_sizeof(t->base) ? etcc_type_sizeof(t->base) : 1)) {
+        sema_error(s, loc, "array is too large");
+        len = 1;
+    }
+    return etcc_type_array(s->arena, t->base, len);
+}
+
+static IrValue *zero_for_ctype(EtccSema *s, EtccCType *t, EtccLoc loc) {
+    IrType *it = map_type(s, t, loc);
+    if (is_pointer(t)) return ir_const_null(s->m, it);
+    return ir_const_int(s->m, it, 0);
+}
+
+static bool zero_object_at(EtccSema *s, EtccCType *t, IrValue *base,
+                           size_t offset, EtccLoc loc) {
+    if (!t) return false;
+    switch (t->kind) {
+    case CT_ARRAY:
+        for (uint64_t i = 0; i < t->array_len; i++) {
+            if (!zero_object_at(s, t->base, base,
+                                offset + (size_t)i * etcc_type_sizeof(t->base),
+                                loc))
+                return false;
+        }
+        return true;
+    case CT_STRUCT:
+        for (EtccField *f = t->fields; f; f = f->next) {
+            if (!zero_object_at(s, f->type, base, offset + f->offset, loc))
+                return false;
+        }
+        return true;
+    case CT_UNION: {
+        EtccField *f = t->fields;
+        if (!f) return false;
+        return zero_object_at(s, f->type, base, offset, loc);
+    }
+    default: {
+        IrValue *p = byte_offset_ptr(s, base, offset);
+        if (!p) return false;
+        ir_build_store(s->m, s->cur, p, zero_for_ctype(s, t, loc));
+        return true;
+    }
+    }
+}
+
+static bool initialize_local_object(EtccSema *s, EtccCType *t, IrValue *base,
+                                    EtccAstNode *init, size_t offset,
+                                    EtccLoc loc) {
+    if (!init) return true;
+
+    if (t->kind == CT_ARRAY) {
+        if (init->kind == AST_STRING_LIT) {
+            if (!is_char_type(t->base)) {
+                sema_error(s, loc, "string initializer requires a char array");
+                return false;
+            }
+            if ((uint64_t)init->u.string_lit.len > t->array_len) {
+                sema_error(s, loc, "string literal is too long for the array");
+                return false;
+            }
+            if (!zero_object_at(s, t, base, offset, loc)) return false;
+            for (size_t i = 0; i < init->u.string_lit.len; i++) {
+                IrValue *p = byte_offset_ptr(s, base, offset + i);
+                if (!p) return false;
+                IrValue *ch = ir_const_int(s->m, ir_type_i8(s->m),
+                                           (unsigned char)init->u.string_lit.data[i]);
+                ir_build_store(s->m, s->cur, p, ch);
+            }
+            return true;
+        }
+        if (init->kind != AST_INIT_LIST) {
+            sema_error(s, loc, "array initializer must be a brace list or string");
+            return false;
+        }
+        if (!zero_object_at(s, t, base, offset, loc)) return false;
+        size_t i = 0;
+        EtccAstNode *it = init->u.init_list.items;
+        for (; it && i < t->array_len; it = it->next, i++) {
+            if (!initialize_local_object(s, t->base, base, it,
+                                         offset + i * etcc_type_sizeof(t->base),
+                                         loc))
+                return false;
+        }
+        if (it)
+            sema_error(s, loc, "too many elements in array initializer");
+        return true;
+    }
+
+    if (is_aggregate(t)) {
+        if (!t->is_complete) {
+            sema_error(s, loc, "initializer for an incomplete type");
+            return false;
+        }
+        if (init->kind == AST_INIT_LIST) {
+            if (!zero_object_at(s, t, base, offset, loc)) return false;
+            EtccField *f = t->fields;
+            EtccAstNode *it = init->u.init_list.items;
+            for (; f && it; f = f->next, it = it->next) {
+                if (!initialize_local_object(s, f->type, base, it,
+                                             offset + f->offset, loc))
+                    return false;
+                if (t->kind == CT_UNION) {
+                    it = it->next;
+                    break;
+                }
+            }
+            if (it)
+                sema_error(s, loc, "too many elements in aggregate initializer");
+            return true;
+        }
+        SemVal v;
+        if (!sema_expr(s, init, &v)) return false;
+        if (!decay(s, &v, loc)) return false;
+        if (!etcc_type_equal(v.type, t)) {
+            sema_error(s, loc, "incompatible initializer type");
+            return false;
+        }
+        IrValue *p = byte_offset_ptr(s, base, offset);
+        if (!p) return false;
+        ir_build_store(s->m, s->cur, p, v.value);
+        return true;
+    }
+
+    if (init->kind == AST_INIT_LIST) {
+        EtccAstNode *only = init->u.init_list.items;
+        if (!only || only->next) {
+            sema_error(s, loc, "scalar initializer must contain exactly one value");
+            return false;
+        }
+        return initialize_local_object(s, t, base, only, offset, loc);
+    }
+
+    SemVal v;
+    if (!sema_expr(s, init, &v)) return false;
+    if (!decay(s, &v, loc)) return false;
+    v.value = convert_value(s, v.value, v.type, t, loc, false);
+    IrValue *p = byte_offset_ptr(s, base, offset);
+    if (!p) return false;
+    ir_build_store(s->m, s->cur, p, v.value);
+    return true;
+}
 
 static bool sema_local_decl(EtccSema *s, EtccAstNode *n) {
     if (n->u.decl.storage == STORAGE_STATIC) {
@@ -1163,9 +1484,10 @@ static bool sema_local_decl(EtccSema *s, EtccAstNode *n) {
         return true;
     }
 
-    EtccCType *t = n->u.decl.type;
-    if (t->kind == CT_VOID || t->kind == CT_FUNC ||
-        (t->kind == CT_ARRAY && t->array_len == 0)) {
+    EtccCType *t = complete_array_type(s, n->u.decl.type, n->u.decl.init,
+                                       n->loc);
+    n->u.decl.type = t;
+    if (!type_is_complete_object(t) || t->kind == CT_FUNC) {
         sema_error(s, n->loc, "variable '%s' has an incomplete type",
                    n->u.decl.name);
         return false;
@@ -1181,11 +1503,8 @@ static bool sema_local_decl(EtccSema *s, EtccAstNode *n) {
     sym->addr = slot;
 
     if (n->u.decl.init) {
-        SemVal v;
-        if (!sema_expr(s, n->u.decl.init, &v)) return false;
-        if (!decay(s, &v, n->loc)) return false;
-        v.value = convert_value(s, v.value, v.type, t, n->loc, false);
-        ir_build_store(s->m, s->cur, slot, v.value);
+        if (!initialize_local_object(s, t, slot, n->u.decl.init, 0, n->loc))
+            return false;
     }
     return true;
 }
@@ -1290,6 +1609,11 @@ static bool sema_stmt(EtccSema *s, EtccAstNode *n) {
         }
         if (!sema_expr(s, n->u.ret.expr, &v)) return false;
         if (!decay(s, &v, n->loc)) return false;
+        if (is_aggregate(v.type)) {
+            sema_error(s, n->loc,
+                       "returning struct/union by value is not supported yet");
+            return false;
+        }
         v.value = convert_value(s, v.value, v.type, s->fn_ret, n->loc, false);
         if (block_open(s)) ir_block_set_ret(s->m, s->cur, v.value);
         s->cur = NULL;
@@ -1552,11 +1876,124 @@ static bool collect_function(EtccSema *s, const char *name, EtccCType *ft,
     return true;
 }
 
+static void write_uint_le(unsigned char *buf, size_t offset, uint64_t value,
+                          size_t size) {
+    for (size_t i = 0; i < size; i++)
+        buf[offset + i] = (unsigned char)((value >> (i * 8)) & 0xFF);
+}
+
+static bool fill_global_object(EtccSema *s, EtccCType *t, EtccAstNode *init,
+                               unsigned char *buf, size_t offset,
+                               EtccLoc loc) {
+    if (!init) return true;
+
+    if (t->kind == CT_ARRAY) {
+        if (init->kind == AST_STRING_LIT) {
+            if (!is_char_type(t->base)) {
+                sema_error(s, loc, "string initializer requires a char array");
+                return false;
+            }
+            if ((uint64_t)init->u.string_lit.len > t->array_len) {
+                sema_error(s, loc, "string literal is too long for the array");
+                return false;
+            }
+            for (size_t i = 0; i < init->u.string_lit.len; i++)
+                buf[offset + i] = (unsigned char)init->u.string_lit.data[i];
+            return true;
+        }
+        if (init->kind != AST_INIT_LIST) {
+            sema_error(s, loc, "array initializer must be a brace list or string");
+            return false;
+        }
+        size_t i = 0;
+        EtccAstNode *it = init->u.init_list.items;
+        for (; it && i < t->array_len; it = it->next, i++) {
+            if (!fill_global_object(s, t->base, it, buf,
+                                    offset + i * etcc_type_sizeof(t->base), loc))
+                return false;
+        }
+        if (it) sema_error(s, loc, "too many elements in array initializer");
+        return true;
+    }
+
+    if (is_aggregate(t)) {
+        if (!t->is_complete) {
+            sema_error(s, loc, "initializer for an incomplete type");
+            return false;
+        }
+        if (init->kind != AST_INIT_LIST) {
+            sema_error(s, loc,
+                       "global aggregate initializer must be a brace list");
+            return false;
+        }
+        EtccField *f = t->fields;
+        EtccAstNode *it = init->u.init_list.items;
+        for (; f && it; f = f->next, it = it->next) {
+            if (!fill_global_object(s, f->type, it, buf, offset + f->offset, loc))
+                return false;
+            if (t->kind == CT_UNION) {
+                it = it->next;
+                break;
+            }
+        }
+        if (it) sema_error(s, loc, "too many elements in aggregate initializer");
+        return true;
+    }
+
+    if (init->kind == AST_INIT_LIST) {
+        EtccAstNode *only = init->u.init_list.items;
+        if (!only || only->next) {
+            sema_error(s, loc, "scalar initializer must contain exactly one value");
+            return false;
+        }
+        return fill_global_object(s, t, only, buf, offset, loc);
+    }
+
+    if (is_pointer(t)) {
+        if (init->kind == AST_STRING_LIT) {
+            sema_error(s, loc,
+                       "pointer relocations in aggregate globals are not supported yet");
+            return false;
+        }
+        int64_t v;
+        if (!const_eval(s, init, &v)) {
+            sema_error(s, loc, "global initializer is not a constant expression");
+            return false;
+        }
+        if (v != 0) {
+            sema_error(s, loc,
+                       "non-null pointer relocations are not supported in aggregate globals yet");
+            return false;
+        }
+        write_uint_le(buf, offset, 0, 8);
+        return true;
+    }
+
+    if (!is_integer(t)) {
+        sema_error(s, loc, "unsupported global initializer type");
+        return false;
+    }
+    int64_t v;
+    if (!const_eval(s, init, &v)) {
+        sema_error(s, loc, "global initializer is not a constant expression");
+        return false;
+    }
+    write_uint_le(buf, offset, (uint64_t)v, etcc_type_sizeof(t));
+    return true;
+}
+
 static bool collect_global_var(EtccSema *s, EtccAstNode *n) {
     const char *name = n->u.decl.name;
-    EtccCType *t = n->u.decl.type;
+    EtccCType *t = complete_array_type(s, n->u.decl.type, n->u.decl.init,
+                                       n->loc);
+    n->u.decl.type = t;
     EtccLoc loc = n->loc;
     if (!name) return false;
+
+    if (!type_is_complete_object(t)) {
+        sema_error(s, loc, "variable '%s' has an incomplete type", name);
+        return false;
+    }
 
     EtccSymbol *sym = scope_find_local(&s->global_scope, name);
     if (sym && sym->kind == SYM_FUNCTION) {
@@ -1613,19 +2050,25 @@ static bool global_initializers(EtccSema *s, EtccAstNode *tu) {
         EtccSymbol *sym = scope_find_local(&s->global_scope, n->u.decl.name);
         if (!sym || sym->kind != SYM_GLOBAL_VAR) continue;
         IrGlobal *g = sym->global;
+        EtccCType *t = sym->type;
         g->is_external = false;
 
-        if (n->u.decl.type->kind == CT_PTR) {
-            if (n->u.decl.init->kind == AST_STRING_LIT) {
+        if (t->kind == CT_PTR) {
+            EtccAstNode *init = n->u.decl.init;
+            if (init->kind == AST_INIT_LIST) {
+                EtccAstNode *only = init->u.init_list.items;
+                if (only && !only->next) init = only;
+            }
+            if (init->kind == AST_STRING_LIT) {
                 IrGlobal *sg = ir_string_literal(s->m,
-                                                 n->u.decl.init->u.string_lit.data,
-                                                 n->u.decl.init->u.string_lit.len);
+                                                 init->u.string_lit.data,
+                                                 init->u.string_lit.len);
                 g->has_ptr_init = true;
                 g->ptr_init = sg;
                 continue;
             }
             int64_t v;
-            if (const_eval(s, n->u.decl.init, &v) && v == 0) {
+            if (const_eval(s, init, &v) && v == 0) {
                 g->has_ptr_init = true;
                 g->ptr_init = NULL;
                 continue;
@@ -1634,12 +2077,35 @@ static bool global_initializers(EtccSema *s, EtccAstNode *tu) {
                        "global pointer initializer must be a string literal or 0");
             continue;
         }
-        if (n->u.decl.type->kind == CT_ARRAY) {
-            sema_error(s, n->loc, "global array initializers are not supported yet");
+
+        if (t->kind == CT_ARRAY || is_aggregate(t)) {
+            if (t->size == 0) {
+                sema_error(s, n->loc, "global initializer has incomplete type");
+                continue;
+            }
+            unsigned char *buf =
+                etcc_arena_alloc(s->arena, t->size, 1);
+            memset(buf, 0, t->size);
+            if (!fill_global_object(s, t, n->u.decl.init, buf, 0, n->loc))
+                continue;
+            g->has_bytes_init = true;
+            g->init_data = (const char *)buf;
+            g->init_len = t->size;
             continue;
         }
+
+        EtccAstNode *init = n->u.decl.init;
+        if (init->kind == AST_INIT_LIST) {
+            EtccAstNode *only = init->u.init_list.items;
+            if (!only || only->next) {
+                sema_error(s, n->loc,
+                           "scalar initializer must contain exactly one value");
+                continue;
+            }
+            init = only;
+        }
         int64_t v;
-        if (!const_eval(s, n->u.decl.init, &v)) {
+        if (!const_eval(s, init, &v)) {
             sema_error(s, n->loc,
                        "initializer for '%s' is not a constant expression",
                        n->u.decl.name);
@@ -1670,6 +2136,19 @@ static bool analyze_function(EtccSema *s, EtccAstNode *n) {
         sema_error(s, n->loc,
                    "variadic function definitions are not supported yet");
         return false;
+    }
+
+    if (is_aggregate(s->fn_ret)) {
+        sema_error(s, n->loc,
+                   "returning struct/union by value is not supported yet");
+        return false;
+    }
+    for (size_t i = 0; i < f->nparams; i++) {
+        if (is_aggregate(n->u.func.type->params[i])) {
+            sema_error(s, n->loc,
+                       "passing struct/union by value is not supported yet");
+            return false;
+        }
     }
 
     if (strcmp(n->u.func.name, "main") == 0) {

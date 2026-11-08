@@ -32,6 +32,9 @@ static void llvm_type(FILE *f, const IrType *t) {
     case IR_TYPE_I32: fputs("i32", f); break;
     case IR_TYPE_I64: fputs("i64", f); break;
     case IR_TYPE_PTR: fputs("ptr", f); break;
+    case IR_TYPE_STRUCT:
+        fprintf(f, "[%zu x i8]", t->size);
+        break;
     case IR_TYPE_ARRAY:
         fprintf(f, "[%llu x ", (unsigned long long)t->count);
         llvm_type(f, t->elem);
@@ -119,6 +122,15 @@ static void emit_global(LlvmEmitter *e, const IrGlobal *g) {
     if (g->is_internal) fputs("internal ", f);
     if (g->is_const) fputs("constant ", f);
     else fputs("global ", f);
+
+    if (g->has_bytes_init) {
+        fprintf(f, "[%zu x i8] ", g->init_len);
+        llvm_escape_bytes(f, g->init_data, g->init_len);
+        if (g->type->align > 1) fprintf(f, ", align %zu", g->type->align);
+        fputc('\n', f);
+        return;
+    }
+
     llvm_type(f, g->type);
     fputc(' ', f);
 
@@ -131,6 +143,7 @@ static void emit_global(LlvmEmitter *e, const IrGlobal *g) {
     } else {
         switch (g->type->kind) {
         case IR_TYPE_ARRAY:
+        case IR_TYPE_STRUCT:
             fputs("zeroinitializer", f);
             break;
         case IR_TYPE_PTR:

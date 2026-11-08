@@ -145,3 +145,5 @@ IrModule → IrFunction → IrBlock → IrInstr
 4. 预处理器：函数式宏、`#`/`##`、完整 `-E`。
 5. x86-64 原生后端：直接生成 COFF，验证 `--backend native` 与 LLVM 后端跑同一套测试。
 6. 自举：用 ETCC 编译 runtime，再编译 ETCC 自身。
+
+> 里程碑 0.2 已完成第 1、2 项的大部分：见 [MILESTONE-0.2.md](MILESTONE-0.2.md)。
