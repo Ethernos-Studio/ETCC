@@ -292,6 +292,53 @@ j=2
 99
 1
 """,
+        "aggregate_abi": """\
+pair=2 3 5
+pair_call=15
+big=10 11 12 33
+big_call=63
+one=Z Q
+""",
+        "aggregate_abi2": """\
+eight=3 4 7
+eight_after=3 4
+twelve=10 11 12 33
+twelve_after=10
+three=198 6
+sixteen=10000000000 20000000000
+sixteen_sum=30000000000
+mixed=x 42 8
+union=D C B A
+long=9000000000
+two=1234
+four=10
+union_int=11223344
+""",
+        "aggregate_abi3": """\
+pair=1 2 -> 2 2
+big=5 6 7 -> 6 6 7
+one=A -> B
+mix=96
+rvalue=30 52
+""",
+        "type_inference": """\
+4294967297 4294967296
+8 4 8 8
+1 2
+8 8
+8 8 4 4 8 8 4
+""",
+        "conversions": """\
+1 1 1 0 1 1 1 0
+0
+""",
+        "const_short": """\
+two
+0 42 1 -1 1
+""",
+        "compound_shift": """\
+-1 1073741824 -2 -2
+""",
     }
     for name, expected in feature_expectations.items():
         out = compile_and_run(name, ROOT / "tests" / f"{name}.c")
@@ -367,17 +414,26 @@ j=2
     # 8b. Aggregate diagnostics.
     aggregate_errors = [
         (
-            "by_value",
-            "struct S { int x; };\n"
-            "int f(struct S s) { return s.x; }\n"
-            "int main(void) { return 0; }\n",
-            "passing struct/union by value",
-        ),
-        (
             "incomplete",
             "struct S;\n"
             "int main(void) { struct S s; return 0; }\n",
             "incomplete type",
+        ),
+        (
+            "arg_mismatch",
+            "struct A { int x; };\n"
+            "struct B { int y; };\n"
+            "int f(struct A a) { return a.x; }\n"
+            "int main(void) { struct B b; return f(b); }\n",
+            "incompatible struct/union argument type",
+        ),
+        (
+            "return_mismatch",
+            "struct A { int x; };\n"
+            "struct B { int y; };\n"
+            "struct A f(void) { struct B b; return b; }\n"
+            "int main(void) { return 0; }\n",
+            "returning an incompatible struct/union",
         ),
         (
             "too_long",
@@ -396,6 +452,39 @@ j=2
             "struct S { int x; };\n"
             "int main(void) { struct S s; return s.y; }\n",
             "no member named 'y'",
+        ),
+        (
+            "pointer_mismatch",
+            "int main(void) {\n"
+            "  int x = 0;\n"
+            "  int *p = &x;\n"
+            "  char *q = p;\n"
+            "  return q != 0;\n"
+            "}\n",
+            "incompatible pointer types in conversion",
+        ),
+        (
+            "void_to_int",
+            "void f(void) { }\n"
+            "int main(void) { int x = f(); return x; }\n",
+            "cannot convert a void expression to a value",
+        ),
+        (
+            "const_overflow",
+            "enum { X = (-9223372036854775807LL - 1) / -1 };\n"
+            "int main(void) { return 0; }\n",
+            "signed integer overflow in constant expression",
+        ),
+        (
+            "case_overflow",
+            "int main(void) {\n"
+            "  switch (0) {\n"
+            "  case (-9223372036854775807LL - 1) / -1:\n"
+            "    break;\n"
+            "  }\n"
+            "  return 0;\n"
+            "}\n",
+            "signed integer overflow in constant expression",
         ),
     ]
     for name, text, needle in aggregate_errors:

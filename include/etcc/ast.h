@@ -163,6 +163,8 @@ struct EtccAstNode {
         struct {
             uint64_t value;
             bool is_unsigned;
+            int long_count; /* 0, 1 (L), 2 (LL) */
+            bool is_decimal;
         } int_lit;
 
         struct {

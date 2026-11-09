@@ -200,6 +200,7 @@ struct IrFunction {
     bool variadic;
     bool is_definition;
     bool is_internal;
+    bool has_sret; /* hidden first pointer parameter for a large aggregate return */
     IrValue **params;
     IrBlock *entry;
     IrBlock *blocks;

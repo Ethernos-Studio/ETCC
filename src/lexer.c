@@ -326,7 +326,8 @@ static EtccToken lex_number(EtccLexer *lx, EtccLoc loc) {
     EtccToken t = make_token(TK_INT_LIT, loc);
     t.v.int_lit.value = value;
     t.v.int_lit.is_unsigned = is_unsigned;
-    t.v.int_lit.is_long = long_count > 0;
+    t.v.int_lit.long_count = long_count;
+    t.v.int_lit.is_decimal = (base == 10);
     return t;
 }
 

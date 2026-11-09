@@ -3,6 +3,7 @@
 #include "etcc/lexer.h"
 
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -229,6 +230,12 @@ static void recover_statement(EtccParser *p) {
     if (check(p, TK_SEMICOLON)) parser_advance(p);
 }
 
+static int64_t parser_const_ashr(int64_t v, int64_t count) {
+    if (count < 0 || count >= 64) return v < 0 ? -1 : 0;
+    if (v >= 0) return v >> count;
+    return (int64_t)(~((~((uint64_t)v)) >> (unsigned)count));
+}
+
 static bool eval_const_int(EtccParser *p, EtccAstNode *n, int64_t *out) {
     if (!n) return false;
     switch (n->kind) {
@@ -256,7 +263,7 @@ static bool eval_const_int(EtccParser *p, EtccAstNode *n, int64_t *out) {
         if (!eval_const_int(p, n->u.unary.operand, &v)) return false;
         switch (n->u.unary.op) {
         case TK_PLUS: *out = v; return true;
-        case TK_MINUS: *out = -v; return true;
+        case TK_MINUS: *out = (int64_t)(0ull - (uint64_t)v); return true;
         case TK_TILDE: *out = ~v; return true;
         case TK_BANG: *out = !v; return true;
         default: return false;
@@ -265,27 +272,50 @@ static bool eval_const_int(EtccParser *p, EtccAstNode *n, int64_t *out) {
     case AST_BINARY: {
         int64_t a, b;
         if (!eval_const_int(p, n->u.binary.lhs, &a)) return false;
+        if (n->u.binary.op == TK_AND_AND) {
+            if (!a) { *out = 0; return true; }
+            if (!eval_const_int(p, n->u.binary.rhs, &b)) return false;
+            *out = b != 0;
+            return true;
+        }
+        if (n->u.binary.op == TK_OR_OR) {
+            if (a) { *out = 1; return true; }
+            if (!eval_const_int(p, n->u.binary.rhs, &b)) return false;
+            *out = b != 0;
+            return true;
+        }
         if (!eval_const_int(p, n->u.binary.rhs, &b)) return false;
         switch (n->u.binary.op) {
-        case TK_PLUS: *out = a + b; return true;
-        case TK_MINUS: *out = a - b; return true;
-        case TK_STAR: *out = a * b; return true;
-        case TK_SLASH:
-            if (b == 0) {
-                parser_error(p, n->loc, "division by zero in constant expression");
-                return false;
-            }
-            *out = a / b;
+        case TK_PLUS:
+            *out = (int64_t)((uint64_t)a + (uint64_t)b);
             return true;
+        case TK_MINUS:
+            *out = (int64_t)((uint64_t)a - (uint64_t)b);
+            return true;
+        case TK_STAR:
+            *out = (int64_t)((uint64_t)a * (uint64_t)b);
+            return true;
+        case TK_SLASH:
         case TK_PERCENT:
             if (b == 0) {
                 parser_error(p, n->loc, "division by zero in constant expression");
                 return false;
             }
-            *out = a % b;
+            if (a == INT64_MIN && b == -1) {
+                parser_error(p, n->loc,
+                             "signed integer overflow in constant expression");
+                return false;
+            }
+            *out = n->u.binary.op == TK_SLASH ? a / b : a % b;
             return true;
-        case TK_SHL: *out = (b < 0 || b >= 64) ? 0 : (int64_t)((uint64_t)a << b); return true;
-        case TK_SHR: *out = (b < 0 || b >= 64) ? 0 : (a >> b); return true;
+        case TK_SHL:
+            *out = (b < 0 || b >= 64)
+                       ? 0
+                       : (int64_t)((uint64_t)a << (unsigned)b);
+            return true;
+        case TK_SHR:
+            *out = parser_const_ashr(a, b);
+            return true;
         case TK_AMP: *out = a & b; return true;
         case TK_PIPE: *out = a | b; return true;
         case TK_CARET: *out = a ^ b; return true;
@@ -295,18 +325,14 @@ static bool eval_const_int(EtccParser *p, EtccAstNode *n, int64_t *out) {
         case TK_GE: *out = a >= b; return true;
         case TK_EQ: *out = a == b; return true;
         case TK_NE: *out = a != b; return true;
-        case TK_AND_AND: *out = (a && b); return true;
-        case TK_OR_OR: *out = (a || b); return true;
         default: return false;
         }
     }
     case AST_COND: {
-        int64_t c, a, b;
+        int64_t c;
         if (!eval_const_int(p, n->u.cond.cond, &c)) return false;
-        if (!eval_const_int(p, n->u.cond.then_expr, &a)) return false;
-        if (!eval_const_int(p, n->u.cond.else_expr, &b)) return false;
-        *out = c ? a : b;
-        return true;
+        return eval_const_int(p, c ? n->u.cond.then_expr : n->u.cond.else_expr,
+                              out);
     }
     case AST_COMMA: {
         int64_t v;
@@ -324,6 +350,10 @@ static bool eval_const_int(EtccParser *p, EtccAstNode *n, int64_t *out) {
         int64_t v;
         if (!eval_const_int(p, n->u.cast.operand, &v)) return false;
         EtccCType *t = n->u.cast.target;
+        if (t && t->kind == CT_BOOL) {
+            *out = v != 0;
+            return true;
+        }
         if (t && etcc_type_is_integer(t) && t->size < 8) {
             uint64_t mask = (1ull << (t->size * 8)) - 1;
             uint64_t u = (uint64_t)v & mask;
@@ -954,6 +984,8 @@ static EtccAstNode *parse_primary(EtccParser *p) {
         EtccAstNode *n = etcc_ast_new(p->arena, AST_INT_LIT, t.loc);
         n->u.int_lit.value = t.v.int_lit.value;
         n->u.int_lit.is_unsigned = t.v.int_lit.is_unsigned;
+        n->u.int_lit.long_count = t.v.int_lit.long_count;
+        n->u.int_lit.is_decimal = t.v.int_lit.is_decimal;
         parser_advance(p);
         return n;
     }

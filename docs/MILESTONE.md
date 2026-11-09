@@ -150,3 +150,5 @@ IrModule → IrFunction → IrBlock → IrInstr
 > 里程碑 0.2 已完成第 1、2 项的大部分：见 [MILESTONE-0.2.md](MILESTONE-0.2.md)。
 >
 > 里程碑 0.3 已完成 `switch`/`goto`/`enum`：见 [MILESTONE-0.3.md](MILESTONE-0.3.md)。
+>
+> 里程碑 0.4 已完成聚合按值 ABI：见 [MILESTONE-0.4.md](MILESTONE-0.4.md)。

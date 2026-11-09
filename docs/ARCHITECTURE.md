@@ -77,6 +77,10 @@
 - 建立全局符号表（函数、全局变量），再分析函数体；
 - 局部作用域、块作用域、`for` 作用域；
 - 整数提升、常用算术转换、指针算术、赋值兼容性；
+- `infer_type()` 复用字面量/二元/条件表达式的统一类型规则，`sizeof` 与 `?:` 不再各自近似；
+- 整数字面量按 C99 6.4.4.1 选择类型，区分十进制/十六进制与 `U`/`L`/`LL` 后缀（Windows LLP64：`long` 为 32 位）；
+- `convert_value()` 对指针兼容性、`void *`、`_Bool` 做显式检查，并拒绝 void→值等非法转换；
+- 常量求值对 `&&`/`||`/`?:` 短路，使用无符号回绕避免宿主机有符号溢出 UB；
 - `struct` / `union` 类型完整性、字段查找、Windows x64 布局（偏移/填充/大小/对齐）；
 - 生成 typed IR：alloca/load/store/gep/bin/cmp/cast/call；
 - 控制流 lowering：`if`、`while`、`do`、`for`、`switch`、`goto`、`&&`/`||` 短路、`?:` 都转换为基本块；
@@ -93,7 +97,9 @@
 - `struct` / `union` 的字段偏移由 `ctype.c` 的布局算法一次算好；
 - sema 对成员访问统一生成 **字节偏移 GEP**（`getelementptr i8, ptr base, i64 offset`），因此后端不需要理解 C 字段；
 - 聚合整体赋值生成 `load <struct> / store <struct>`；
-- 聚合按值传参/返回尚未实现，会给出明确诊断；指针传参完全支持。
+- 聚合按值传参/返回在 sema 中按 Windows x64 MSVC ABI lowering：1/2/4/8 字节聚合变成 `i8/i16/i32/i64`，更大的聚合参数变成 `ptr`，更大的聚合返回变成隐藏 `sret` 指针 + `void` 返回；
+- 大聚合参数由调用者复制到临时对象，小的聚合返回在调用点展开为临时对象；
+- 指针传参、指针返回完全支持。
 
 ### 2.5 Backend (`backend.c`, `backend_llvm.c`)
 
@@ -273,9 +279,10 @@ __declspec(noreturn) void etcc_entry(void) {
 4. typedef/tag 名称仅由 parser 维护，语义阶段没有独立的 tag/typedef 命名空间。
 5. 全局 tentative definition 的重复声明规则还不完整。
 6. 临时文件放在当前工作目录，若在只读目录运行需要显式指定可写目录（后续可加 `TMPDIR`/输出目录策略）。
-7. 聚合按值传参/返回、位域、指定初始化器、flexible array member 尚未实现。
+7. 位域、指定初始化器、flexible array member、函数指针、变参函数定义尚未实现。
 8. 全局聚合初始化暂不支持非空指针重定位。
-9. `switch` 目前降级为线性 case 比较链，尚无 jump table 优化；`goto` 的死块策略会生成少量不可达块。
-10. 枚举类型统一按 `int` 表示，尚无底层类型选择/`_Generic` 等机制。
+9. 聚合通过可变参数传递、浮点聚合字段和向量 ABI 尚未实现。
+10. `switch` 目前降级为线性 case 比较链，尚无 jump table 优化；`goto` 的死块策略会生成少量不可达块。
+11. 枚举类型统一按 `int` 表示，尚无底层类型选择/`_Generic` 等机制。
 
 这些债不会阻碍新增后端：后端只消费 IR，不依赖前端内部结构。

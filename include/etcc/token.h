@@ -117,7 +117,8 @@ typedef struct EtccToken {
         struct {
             uint64_t value;
             bool is_unsigned;
-            bool is_long;
+            int long_count; /* 0, 1 (L), 2 (LL) */
+            bool is_decimal;
         } int_lit;
         struct {
             int64_t value;

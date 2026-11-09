@@ -153,6 +153,7 @@ ETCC_RUNTIME_INCLUDE
 - 结构体/联合体指针、结构体数组、嵌套结构体
 - `s.x`、`p->x`、`s.a.b`、`p->a[i].x`
 - `struct S a = b;` 整体复制
+- `struct` / `union` 按值传参和返回：1/2/4/8 字节走整数寄存器，更大的走隐藏指针（Windows x64 MSVC ABI）
 - 局部与全局的 `{ ... }` 聚合初始化，支持嵌套、部分初始化补零
 - `char s[] = "abc"`、`char buf[8] = "hi"`、`int a[] = {1, 2, 3}` 长度推导
 - 全局整数/字符数组、结构体、联合体初始化（编译期写为静态字节数据）
@@ -237,6 +238,10 @@ cmake --build --preset mingw --target check
 - `struct` / `union` 布局、嵌套、成员访问、自引用链表、整体赋值
 - 局部/全局聚合初始化、部分初始化补零、字符串数组长度推导
 - 结构体数组、结构体指针算术、`->` 链式访问
+- `struct` / `union` 1/2/4/8/12/16 字节按值传参/返回、隐藏 sret、按值复制语义
+- 条件表达式/二元表达式/`sizeof` 的类型推断，`_Bool`/`void *`/指针兼容性转换
+- 十进制/十六进制字面量与 `U`/`L`/`LL` 后缀的 C99 类型选择
+- 常量表达式短路求值、溢出诊断；复合移位赋值按左操作数类型执行
 - `switch`/fallthrough/嵌套 switch、`goto` 跨块跳转、`enum` 常量与作用域
 - `case` 常量、重复 case/default、未知标签等错误诊断
 - 字符串/字符转义、相邻字符串拼接
@@ -248,7 +253,7 @@ cmake --build --preset mingw --target check
 - 预处理输出
 - 后端注册表与未知后端错误
 
-最近一次结果：**85 passed, 0 failed**。
+最近一次结果：**104 passed, 0 failed**。
 
 ## 性能：瓶颈在哪里
 
@@ -321,12 +326,12 @@ CMakePresets.json      MinGW Makefiles 配置/构建/测试 preset
 - [里程碑 0.1](docs/MILESTONE.md)
 - [里程碑 0.2：聚合类型与初始化器](docs/MILESTONE-0.2.md)
 - [里程碑 0.3：控制流与枚举](docs/MILESTONE-0.3.md)
+- [里程碑 0.4：聚合按值 ABI](docs/MILESTONE-0.4.md)
 
 ## 当前限制（有意留在后续里程碑）
 
 - 目标固定为 **Windows x64 / Microsoft ABI**；宿主也按 Windows 构建。
 - 不支持浮点类型、函数指针、变参函数**定义**、VLA、位域、`_Atomic`。
-- `struct` / `union` 还不能按值传参或返回（会给出明确诊断）；成员访问/指针/赋值/初始化已可用。
 - 初始化器不支持指定初始化器（`.field =`、`[index] =`）、flexible array member、嵌套花括号省略。
 - 全局聚合初始化暂不支持非空指针重定位（例如 `struct { char *p; } g = { "x" };`）；零指针可以。
 - 局部 `static` 变量暂未实现。
@@ -338,10 +343,10 @@ CMakePresets.json      MinGW Makefiles 配置/构建/测试 preset
 
 ## 路线图
 
-1. **类型系统继续扩展**：结构体按值传参/返回的 ABI、位域、`_Alignas`、函数指针。
+1. **类型系统继续扩展**：函数指针、位域、`_Alignas`、变参函数定义。
 2. **初始化器完整化**：指定初始化器、flexible array member、花括号省略、全局指针重定位。
 3. **预处理器完整化**：函数式宏、`#`/`##`、宏展开后的 `-E`、`#line`。
-4. **语言完整性**：变参函数定义、浮点。
+4. **语言完整性**：浮点。
 5. **运行时扩展**：文件 I/O、`FILE`、更完整的格式化、环境变量、堆调试。
 6. **优化与诊断**：常量折叠、死代码消除、类型检查强化、警告分级。
 7. **新后端**：x86-64 原生后端（直接生成 COFF/PE）、C 后端、WASM 后端；用同一套测试矩阵验证。
